@@ -1,0 +1,7 @@
+numpy
+
+[mps]
+torch
+
+[test]
+pytest

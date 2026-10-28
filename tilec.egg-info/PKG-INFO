@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: tilec
+Version: 0.1.0
+Summary: A Triton-compatible tile language with an Apple GPU (Metal) backend
+Requires-Dist: numpy
+Provides-Extra: mps
+Requires-Dist: torch; extra == "mps"
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"
