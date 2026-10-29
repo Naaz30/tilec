@@ -1,4 +1,4 @@
-"""Metal Shading Language backend (Tier 1: scalars and 1-D tiles).
+"""Metal Shading Language backend (scalars and N-D tiles).
 
 Mapping:
     program instance      -> one threadgroup
@@ -7,6 +7,8 @@ Mapping:
     tl.program_id(axis)   -> threadgroup_position_in_grid
     reductions            -> per-thread partials, simd_sum/max/min, then
                              threadgroup memory across SIMD-groups
+    broadcast / axis reduce -> stage the tile in threadgroup memory, barrier,
+                             then each thread reads the elements it needs
 
 Runtime scalar arguments are passed as 1-element buffers, which keeps the
 calling convention identical for every launcher.
@@ -157,7 +159,7 @@ class MSLCodegen:
         shared = ["    " + s for s in self.shared]
         return "\n".join(header + shared + self.body + ["}"]) + "\n"
 
-    
+    # thread group id or program id along 'axis'
     def op_program_id(self, op):
         axis = "xyz"[op.attrs["axis"]]
         self.emit(f"const int {self.name(op.result)} = int(tgpig.{axis});")
@@ -177,22 +179,53 @@ class MSLCodegen:
         self.define(op.result, "int",
                     lambda r: f"{start} + int{lay.element(r, 'tid')}")
 
+    def stage(self, v):
+        """Copy tile v into threadgroup memory (row-major), so any thread can read any element."""
+        ct = self.off_type[v.id] if v.type.is_ptr else self.elem_ctype(v.type)
+        st = "uchar" if ct == "bool" else ct          # Metal can't share bool arrays
+        buf = f"tg{len(self.shared)}"
+        self.shared.append(f"threadgroup {st} {buf}[{v.type.numel}];")
+        lay = self.layout(v)
+        stmt = f"{buf}[{lay.flat('r', 'tid')}] = {st}({self.ref(v, 'r')});"
+        if lay.valid("r", "tid"):
+            stmt = f"if ({lay.valid('r', 'tid')}) {stmt}"
+        self.emit(f"for (uint r = 0; r < {lay.regs}u; ++r) {stmt}")
+        self.emit("threadgroup_barrier(mem_flags::mem_threadgroup);")
+        return buf
+
     def op_broadcast(self, op):
-        src = op.operands[0]
-        if not (src.type.is_scalar or src.type.numel == 1):
-            raise UnsupportedError("broadcasting between non-trivial tiles needs Tier 2 layouts")
-        if op.result.type.is_ptr:
-            self.ptr_base[op.result.id] = self.ptr_base[src.id]
-            self.off_type[op.result.id] = self.off_type[src.id]
-            self.define(op.result, self.off_type[src.id], lambda r: self.ref(src, r))
-        else:
-            self.define(op.result, self.elem_ctype(op.result.type), lambda r: self.ref(src, r))
+        src, dst = op.operands[0], op.result
+        if dst.type.is_ptr:
+            self.ptr_base[dst.id] = self.ptr_base[src.id]
+            self.off_type[dst.id] = self.off_type[src.id]
+        ct = self.off_type[dst.id] if dst.type.is_ptr else self.elem_ctype(dst.type)
+
+        # one value -> every slot gets it (unchanged behaviour)
+        if src.type.is_scalar or src.type.numel == 1:
+            self.define(dst, ct, lambda r: self.ref(src, r))
+            return
+
+        # many values: stage src, then each slot reads src[its coordinates]
+        out_lay = self.layout(dst)
+        pad = len(dst.type.shape) - len(src.type.shape)
+        src_shape = (1,) * pad + tuple(src.type.shape)
+        src_strides = (0,) * pad + self.layout(src).strides
+        terms = [f"{out_lay.coord(ax, 'r', 'tid')} * {src_strides[ax]}u"
+                 for ax, size in enumerate(src_shape) if size != 1]
+        buf = self.stage(src)
+        read = f"{ct}({buf}[{' + '.join(terms)}])"
+        if out_lay.ragged:
+            read = f"({out_lay.valid('r', 'tid')} ? {read} : {ct}(0))"
+        self.define(dst, ct, lambda r: read)
 
     def op_expand_dims(self, op):
-        src = op.operands[0]
-        if not src.type.is_scalar:
-            raise UnsupportedError("expand_dims on tiles needs Tier 2 layouts")
-        self.op_broadcast(op)
+        # adding a size-1 axis doesn't move any element -> plain copy
+        src, dst = op.operands[0], op.result
+        if dst.type.is_ptr:
+            self.ptr_base[dst.id] = self.ptr_base[src.id]
+            self.off_type[dst.id] = self.off_type[src.id]
+        ct = self.off_type[dst.id] if dst.type.is_ptr else self.elem_ctype(dst.type)
+        self.define(dst, ct, lambda r: self.ref(src, r))
 
     def op_cast(self, op):
         src = op.operands[0]
@@ -285,8 +318,8 @@ class MSLCodegen:
     def op_reduce(self, op):
         x = op.operands[0]
         kind = op.attrs["kind"]
-        if x.type.is_scalar or len(x.type.shape) != 1:
-            raise UnsupportedError("reductions over N-D tiles need Tier 2 layouts")
+        if x.type.is_scalar:
+            raise UnsupportedError("cannot reduce a scalar")
         dt = x.type.elem
         if dt.is_bool:
             raise UnsupportedError("max/min over booleans is not supported yet")
@@ -301,6 +334,31 @@ class MSLCodegen:
             ident = f"{ct}(INFINITY)" if dt.is_float else f"numeric_limits<{ct}>::max()"
             combine, simd = "min({a}, {b})", "simd_min"
 
+        if not op.result.type.is_scalar:
+            # reduce along one axis: stage x, each output slot loops k over that axis
+            axis = op.attrs["axis"]
+            out_lay = self.layout(op.result)
+            idx = []
+            for ax in range(len(x.type.shape)):
+                if ax == axis:
+                    c = "k"
+                else:
+                    c = out_lay.coord(ax if ax < axis else ax - 1, "r", "tid")
+                idx.append(f"{c} * {lay.strides[ax]}u")
+            buf = self.stage(x)
+            step = combine.format(a="acc", b=f"{ct}({buf}[{' + '.join(idx)}])")
+            loop = f"for (uint k = 0; k < {x.type.shape[axis]}u; ++k) acc = {step};"
+            if out_lay.ragged:
+                loop = f"if ({out_lay.valid('r', 'tid')}) {loop}"
+            name = self.name(op.result)
+            self.emit(f"{ct} {name}[{out_lay.regs}];")
+            self.emit(f"for (uint r = 0; r < {out_lay.regs}u; ++r) {{")
+            self.emit(f"{ct} acc = {ident};", indent=2)
+            self.emit(loop, indent=2)
+            self.emit(f"{name}[r] = acc;", indent=2)
+            self.emit("}")
+            return
+
         k = self.n_reduce
         self.n_reduce += 1
         scratch = f"red{k}"
@@ -312,7 +370,7 @@ class MSLCodegen:
         body = f"{acc} = {step};"
         if guard:
             body = f"if ({guard}) {body}"
-        self.emit(f"// reduce {kind} over {x.type.shape[0]} elements")
+        self.emit(f"// reduce {kind} over {x.type.numel} elements")
         self.emit(f"{ct} {acc} = {ident};")
         self.emit(f"for (uint r = 0; r < {lay.regs}u; ++r) {body}")
         self.emit(f"{acc} = {simd}({acc});")

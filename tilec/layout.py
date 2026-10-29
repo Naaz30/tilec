@@ -36,7 +36,7 @@ class Blocked:
     shape: tuple
     threads: int
 
-    # ---------------------------------------------------------- sizes
+    #----------------- returns actual sizes, dims, and bools ----------------- #
     @property
     def rank(self) -> int:
         return len(self.shape)
@@ -70,7 +70,7 @@ class Blocked:
             acc *= size
         return tuple(reversed(out))
 
-    # ---------------------------------------------------------- MSL expressions
+    # ----------------- returns MSL expressions --------------------- #
     def flat(self, r: str, tid: str) -> str:
         """Flat (row-major) element index held in register slot r."""
         if self.replicated:
@@ -99,7 +99,6 @@ class Blocked:
             return f"({self.flat(r, tid)} < {self.n}u)"
         return None
 
-    # ---------------------------------------------------------- used by codegen today
     def element(self, r: str, tid: str) -> str:
         """Element index of a 1-D tile (same as flat)."""
         return self.flat(r, tid)
@@ -108,7 +107,7 @@ class Blocked:
         """Guard for stores and reductions; codegen calls it inside its `for r` loops."""
         return self.valid(r, tid)
 
-    # ---------------------------------------------------------- host-side helpers
+    # helperr for debugging
     def holder(self, index) -> tuple:
         """(tid, r) of the first thread holding the element at ``index`` (for tests/docs)."""
         if isinstance(index, int):
