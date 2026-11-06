@@ -1,13 +1,11 @@
-"""tilec: a Triton-compatible tile language with an Apple GPU (Metal) backend.
-
-    import tilec as triton
-    import tilec.language as tl
+"""tilec: a Triton-like tile language for Apple GPUs.
+Python parses a @jit kernel into an AST; the Rust core (tilec._core) turns
+the AST into IR and the IR into Metal, which runs through PyTorch's MPS backend.
 """
 
-from . import language
-from .frontend import CompileError
-from .jit import CompiledKernel, JITFunction, jit
-from .language import cdiv
+from . import ext, language
+from ._core import CompileError
+from .jit import jit
 
-__all__ = ["jit", "cdiv", "language", "CompileError", "CompiledKernel", "JITFunction"]
+__all__ = ["ext", "jit", "language", "CompileError"]
 __version__ = "0.1.0"

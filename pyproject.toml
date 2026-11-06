@@ -1,16 +1,18 @@
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 [project]
 name = "tilec"
 version = "0.1.0"
-description = "A Triton-compatible tile language with an Apple GPU (Metal) backend"
-dependencies = ["numpy"]
+description = "A Triton-like tile language for Apple GPUs: Python front end, Rust compiler, Metal backend"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.5"]
 
 [project.optional-dependencies]
-mps = ["torch"]
-test = ["pytest"]
+test = ["pytest", "numpy"]
 
-[tool.setuptools]
-packages = ["tilec"]
+[tool.maturin]
+module-name = "tilec._core"          # src/lib.rs becomes tilec/_core.*.so
+python-source = "."                  # the Python package is ./tilec
+features = ["pyo3/extension-module"]

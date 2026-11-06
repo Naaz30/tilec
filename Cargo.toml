@@ -1,0 +1,11 @@
+[package]
+name = "tilec"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_core"               # the compiled module is tilec/_core.*.so
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = "0.23"
