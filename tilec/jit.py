@@ -1,10 +1,14 @@
 import ast
 import inspect
+import os
 import textwrap
 from dataclasses import dataclass
 
 from . import language as tl
 from ._core import compile as _compile
+
+os.environ.setdefault("TILEC_OPT", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                "mlir", "build", "tilec-opt"))
 
 # each threadgroup is further devided into 4 SIMD groups
 # as name suggests each SIMD group runs same instruction on diff data.

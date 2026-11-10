@@ -34,12 +34,13 @@ fn compile<'py>(fdef: Bound<'py, PyAny>, param_types: HashMap<String, String>,
     let mut fe = frontend::FrontEnd::new(&name, globals, source, first_line);
     fe.build(&fdef, &types, &constexprs)?;
     let ir = fe.func.to_string();
-    if let Ok(tool) = std::env::var("TILEC_OPT") {
-        let (opt, msl) = mlir::lower(&tool, &mlir::generate(&fe.func, num_warps)?)?;
-        return Ok((format!("{ir}\n\n{opt}"), msl));
+    match std::env::var("TILEC_OPT") {
+        Ok(tool) if !tool.is_empty() => {
+            let (opt, msl) = mlir::lower(&tool, &mlir::generate(&fe.func, num_warps)?)?;
+            Ok((format!("{ir}\n\n{opt}"), msl))
+        }
+        _ => Ok((ir, codegen::generate(&fe.func, num_warps)?)),
     }
-    let msl = codegen::generate(&fe.func, num_warps)?;
-    Ok((ir, msl))
 }
 
 #[pymodule]

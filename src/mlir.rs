@@ -369,7 +369,8 @@ pub fn lower(tool: &str, mlir: &str) -> PyResult<(String, String)> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| CompileError::new_err(format!("cannot run {tool}: {e}")))?;
+        .map_err(|e| CompileError::new_err(format!(
+            "cannot run {tool}: {e}\nbuild it with `ninja -C mlir/build`, or set TILEC_OPT= (empty) to use the built-in Metal backend")))?;
     child.stdin.take().unwrap().write_all(mlir.as_bytes())?;
     let out = child.wait_with_output()?;
     if !out.status.success() {
