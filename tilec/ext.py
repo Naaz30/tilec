@@ -16,44 +16,67 @@ def _row_sum_kernel(x_ptr, out_ptr, N, ROW0, BLOCK: tl.constexpr, CHUNKS: tl.con
     # each row is then divided into CHUNKS of size BLOCK that
     # that threadgroup processes one after the other
     pid = tl.program_id(0)
+    cols0 = tl.arange(0, BLOCK)
     for i in tl.static_range(ROWS):
         row = ROW0 + pid * ROWS + i
-        acc = 0.0
+        acc_t = tl.load(x_ptr + row * N + cols0, mask=cols0 < 0, other=0.0)
         for c in tl.static_range(CHUNKS):
-            cols = c * BLOCK + tl.arange(0, BLOCK)
-            v = tl.load(x_ptr + row * N + cols, mask=cols < N, other=0.0)
-            acc = acc + tl.sum(v)
-        tl.store(out_ptr + row, acc)
+            cols = c * BLOCK + cols0
+            acc_t = acc_t + tl.load(x_ptr + row * N + cols, mask=cols < N, other=0.0)
+        tl.store(out_ptr + row, tl.sum(acc_t))
+
+
+@jit
+def _col_sum_kernel(x_ptr, out_ptr, M, N, BLOCK: tl.constexpr):
+    cols = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    acc_t = tl.load(x_ptr + cols, mask=cols < 0, other=0.0)
+    for i in range(M):
+        acc_t = acc_t + tl.load(x_ptr + i * N + cols, mask=cols < N, other=0.0)
+    tl.store(out_ptr + cols, acc_t)
 
 @jit
 def _matrix_mul(x1, x2, out_ptr, N, M2, ROW0, COL0, LEN, OUT0,
                 BLOCK: tl.constexpr, CHUNKS: tl.constexpr, ROWS: tl.constexpr):
     pid = tl.program_id(0)
+    cols0 = tl.arange(0, BLOCK)
     for i in tl.static_range(ROWS):
         row = ROW0 + pid * ROWS + i
         for r2 in range(M2):
-            acc = 0.0
+            acc_t = tl.load(x1 + row * N + COL0 + cols0, mask=cols0 < 0, other=0.0)
             for c in tl.static_range(CHUNKS):
-               cols = c * BLOCK + tl.arange(0, BLOCK)
+               cols = c * BLOCK + cols0
                v1 = tl.load(x1 + row * N + COL0 + cols, mask=cols < LEN, other=0.0)
                v2 = tl.load(x2 + r2 * N + COL0 + cols, mask=cols < LEN, other=0.0)
-               acc = acc + tl.sum(tl.mul(v1,v2))
-               tl.barrier()
-            tl.store(out_ptr + OUT0 + row * M2 + r2, acc)
+               acc_t = acc_t + tl.mul(v1,v2)
+            tl.store(out_ptr + OUT0 + row * M2 + r2, tl.sum(acc_t))
+
+@jit
+def _matmul_tiled(a, b, c, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    rn = tl.program_id(1) * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN))
+    for k in range(0, K, BK):
+        ka = k + rk
+        x = tl.load(a + rm[:, None] * K + ka[None, :], mask=(rm[:, None] < M) & (ka[None, :] < K), other=0.0)
+        y = tl.load(b + ka[:, None] * N + rn[None, :], mask=(ka[:, None] < K) & (rn[None, :] < N), other=0.0)
+        acc = acc + tl.dot(x, y)
+    tl.store(c + rm[:, None] * N + rn[None, :], acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 # return the maximum possible memory that can be help by a
 # unit of execution (threadgroup) aka BLOCK
 # and the number of such units of execution aka CHUNKS
 def plan(N, block=None):
     if block is None:
-        block = 1 << (N - 1).bit_length()
-        block = block if block < MAX_BLOCK else MAX_BLOCK
+        block = 1
+        while block < N and block < MAX_BLOCK:
+            block *= 4
     return block, cdiv(N, block)
 
 
 SPLITS = (1, 2, 4, 8, 16, 32, 64)
 JOINS = (1, 2, 4, 8)
-BLOCKS = (128, 256, 512, 1024, 2048, 4096)
+BLOCKS = (256, 1024, 4096)
 
 # we iterate through every possible factor by which the
 # number of rows can be divided or combined.
@@ -90,20 +113,39 @@ def _row_sum(x, split, join, block=None):
     return out
 
 
+def _col_sum(x, block=128):
+    M, N = x.shape
+    grid = cdiv(N, block)
+    out = x.new_empty(grid * block)
+    _col_sum_kernel[(grid,)](x, out, M, N, BLOCK=block)
+    return out[:N]
+
+
 # sum a 2-D float32 MPS tensor along axis 0 or 1
 def sum(x, axis, config=(1, 1, None)):
-    if axis == 0:
-        x = x.T
     x = x.contiguous()
+    if axis == 0:
+        return _col_sum(x)
     return _row_sum(x, *config)
 
 
+def _matrix_mul_tiled(x1, x2, BM=64, BN=64, BK=16):
+    M, K = x1.shape
+    K2, N = x2.shape
+    if K != K2:
+        raise ValueError(f"matrix_mul: shapes {tuple(x1.shape)} and {tuple(x2.shape)} don't match")
+    x1 = x1.contiguous()
+    x2 = x2.contiguous()
+    out = x1.new_empty(M, N)
+    _matmul_tiled[(cdiv(M, BM), cdiv(N, BN))](x1, x2, out, M, N, K, BM=BM, BN=BN, BK=BK)
+    return out
+
+
 def matrix_mul(x1,x2, config=None):
+    if config is None:
+        return _matrix_mul_tiled(x1, x2)
     M1, N = x1.shape
     N, M2 = x2.shape
-    if config is None:
-        from .tune import pick
-        config = pick(M1, N, M2)
     #so both matrices are traversed row major
     x1 = x1.contiguous()
     x2 = x2.T

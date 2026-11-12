@@ -46,13 +46,14 @@ struct Gen<'a> {
     ptr_base: HashMap<usize, String>, 
     n_reduce: usize,
     depth: usize, 
+    loops: Vec<Vec<usize>>,
 }
 
 impl<'a> Gen<'a> {
     fn layout(&self, v: usize) -> PyResult<Layout> {
         let shape = &self.f.ty(v).shape;
         if shape.len() != 1 {
-            return Err(CompileError::new_err("the Metal backend only supports 1-D tiles"));
+            return Err(CompileError::new_err("2-D tiles need the MLIR backend (unset TILEC_OPT or point it at tilec-opt)"));
         }
         Ok(Layout { n: shape[0], threads: self.threads })
     }
@@ -87,6 +88,40 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
+    fn copy(&mut self, dst: usize, src: usize) -> PyResult<()> {
+        if self.f.ty(src).ptr {
+            let b = self.base(src);
+            self.ptr_base.insert(dst, b);
+        }
+        let scalar = self.scalar(src);
+        self.define(dst, move |r| slot(src, scalar, r))
+    }
+
+    fn copy_named(&mut self, dst: &str, like: usize, src: usize, declare: bool) -> PyResult<()> {
+        let ct = self.ctype(like);
+        if self.scalar(like) {
+            let decl = if declare { format!("{ct} ") } else { String::new() };
+            self.emit(format!("{decl}{dst} = v{src};"));
+            return Ok(());
+        }
+        let regs = self.layout(like)?.regs();
+        if declare {
+            self.emit(format!("{ct} {dst}[{regs}];"));
+        }
+        self.emit(format!("for (uint r = 0; r < {regs}u; ++r) {dst}[r] = v{src}[r];"));
+        Ok(())
+    }
+
+    fn assign(&mut self, dst: &str, src: &str, like: usize) -> PyResult<()> {
+        if self.scalar(like) {
+            self.emit(format!("{dst} = {src};"));
+            return Ok(());
+        }
+        let regs = self.layout(like)?.regs();
+        self.emit(format!("for (uint r = 0; r < {regs}u; ++r) {dst}[r] = {src}[r];"));
+        Ok(())
+    }
+
     fn base(&self, ptr: usize) -> String {
         self.ptr_base[&ptr].clone()
     }
@@ -113,7 +148,7 @@ impl<'a> Gen<'a> {
         ]);
         self.body.insert(0, "    const uint tid = tid3.x;".to_string());
 
-        for op in &self.f.ops {
+        for (i, op) in self.f.ops.iter().enumerate() {
             match op.opcode {
                 "program_id" => self.op_program_id(op),
                 "constant" => self.op_constant(op),
@@ -126,15 +161,42 @@ impl<'a> Gen<'a> {
                 "store" => self.op_store(op)?,
                 "reduce" => self.op_reduce(op)?,
                 "loop_begin" => {
-                    let (start, end, iv) = (op.operands[0], op.operands[1], op.result.unwrap());
-                    self.emit(format!("for (int v{iv} = v{start}; v{iv} < v{end}; ++v{iv}) {{"));
+                    let (start, end, step, iv) = (op.operands[0], op.operands[1], op.operands[2], op.result.unwrap());
+                    let args: Vec<usize> = self.f.ops[i + 1..].iter()
+                        .take_while(|o| o.opcode == "loop_arg")
+                        .map(|o| o.result.unwrap())
+                        .collect();
+                    for (a, init) in args.iter().zip(&op.operands[3..]) {
+                        self.copy(*a, *init)?;
+                    }
+                    self.loops.push(args);
+                    self.emit(format!("for (int v{iv} = v{start}; v{iv} < v{end}; v{iv} += v{step}) {{"));
                     self.depth += 1;
                 }
+                "loop_arg" => {}
                 "loop_end" => {
+                    let args = self.loops.pop().unwrap();
+                    let temp = op.operands.iter().any(|y| args.contains(y));
+                    for (a, y) in args.iter().zip(&op.operands) {
+                        if temp {
+                            self.copy_named(&format!("t{a}"), *a, *y, true)?;
+                        } else {
+                            self.copy_named(&format!("v{a}"), *a, *y, false)?;
+                        }
+                    }
+                    if temp {
+                        for a in &args {
+                            let (dst, src) = (format!("v{a}"), format!("t{a}"));
+                            self.assign(&dst, &src, *a)?;
+                        }
+                    }
                     self.depth -= 1;
                     self.emit("}".to_string());
                 }
+                "loop_result" => self.copy(op.result.unwrap(), op.operands[0])?,
                 "barrier" => self.emit("threadgroup_barrier(mem_flags::mem_threadgroup);".to_string()),
+                "expand_dims" | "dot" => return Err(CompileError::new_err(format!(
+                    "op '{}' needs the MLIR backend (unset TILEC_OPT or point it at tilec-opt)", op.opcode))),
                 other => return Err(CompileError::new_err(format!("Metal backend: op '{other}' not supported"))),
             }
         }
@@ -157,7 +219,8 @@ impl<'a> Gen<'a> {
 
     fn op_program_id(&mut self, op: &Op) {
         let r = op.result.unwrap();
-        self.emit(format!("const int v{r} = int(tgpig.x);"));
+        let axis = match op.attr("axis") { Attr::Int(1) => "y", Attr::Int(2) => "z", _ => "x" };
+        self.emit(format!("const int v{r} = int(tgpig.{axis});"));
     }
 
     fn op_constant(&mut self, op: &Op) {
@@ -194,7 +257,7 @@ impl<'a> Gen<'a> {
 
     fn op_binary(&mut self, op: &Op) -> PyResult<()> {
         let (a, b, r) = (op.operands[0], op.operands[1], op.result.unwrap());
-        let sym = match op.attr("kind") { Attr::Str("add") => "+", Attr::Str("mul") => "*", _ => unreachable!() };
+        let sym = match op.attr("kind") { Attr::Str("add") => "+", Attr::Str("mul") => "*", Attr::Str("and") => "&", _ => unreachable!() };
         let ct = self.ctype(r);
         let (sa, sb) = (self.scalar(a), self.scalar(b));
         self.define(r, |r| format!("{ct}({} {sym} {})", slot(a, sa, r), slot(b, sb, r)))
@@ -224,14 +287,20 @@ impl<'a> Gen<'a> {
     fn op_store(&mut self, op: &Op) -> PyResult<()> {
         let (ptr, val) = (op.operands[0], op.operands[1]);
         let base = self.base(ptr);
+        let mask = op.operands.get(2).copied();
         if self.f.ty(val).is_scalar() {                
-            self.emit(format!("if (tid == 0u) {base}[v{ptr}] = v{val};"));
+            let m = mask.map(|m| format!(" && v{m}")).unwrap_or_default();
+            self.emit(format!("if (tid == 0u{m}) {base}[v{ptr}] = v{val};"));
             return Ok(());
         }
         let lay = self.layout(val)?;
         let mut stmt = format!("{base}[v{ptr}[r]] = v{val}[r];");
-        if let Some(g) = lay.owner_guard() {
-            stmt = format!("if ({g}) {stmt}");
+        let mut conds: Vec<String> = lay.owner_guard().into_iter().collect();
+        if let Some(m) = mask {
+            conds.push(slot(m, self.scalar(m), "r"));
+        }
+        if !conds.is_empty() {
+            stmt = format!("if ({}) {stmt}", conds.join(" && "));
         }
         self.emit(format!("for (uint r = 0; r < {}u; ++r) {stmt}", lay.regs()));
         Ok(())
@@ -275,6 +344,7 @@ pub fn generate(f: &Function, num_warps: usize) -> PyResult<String> {
         ptr_base: HashMap::new(),
         n_reduce: 0,
         depth: 0,
+        loops: vec![],
     }
     .generate()
 }

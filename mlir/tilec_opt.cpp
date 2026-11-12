@@ -179,8 +179,8 @@ struct Emitter {
       if (t.getDimension() != gpu::Dimension::x) { err = "only gpu.thread_id x"; return false; }
       define(t.getResult(), "int(tid3.x)");
     } else if (auto b = dyn_cast<gpu::BlockIdOp>(op)) {
-      if (b.getDimension() != gpu::Dimension::x) { err = "only gpu.block_id x"; return false; }
-      define(b.getResult(), "int(tgpig.x)");
+      std::string d = b.getDimension() == gpu::Dimension::x ? "x" : b.getDimension() == gpu::Dimension::y ? "y" : "z";
+      define(b.getResult(), "int(tgpig." + d + ")");
     } else if (auto r = dyn_cast<gpu::SubgroupReduceOp>(op)) {
       std::string k = gpu::stringifyAllReduceOperation(r.getOp()).str();
       if (!reduce.count(k)) { err = "unsupported subgroup_reduce " + k; return false; }
@@ -192,7 +192,12 @@ struct Emitter {
     } else if (auto st = dyn_cast<memref::StoreOp>(op)) {
       line(name(st.getMemRef()) + "[" + name(st.getIndices()[0]) + "] = " + name(st.getValue()) + ";");
     } else if (auto f = dyn_cast<scf::ForOp>(op)) {
-      if (f.getNumRegionIterArgs()) { err = "scf.for with iter_args"; return false; }
+      for (auto [arg, init, res] : llvm::zip(f.getRegionIterArgs(), f.getInitArgs(), f.getResults())) {
+        std::string n = fresh();
+        line(type(arg.getType()) + " " + n + " = " + name(init) + ";");
+        names[arg] = n;
+        names[res] = n;
+      }
       std::string iv = fresh();
       names[f.getInductionVar()] = iv;
       line("for (int " + iv + " = " + name(f.getLowerBound()) + "; " + iv + " < " + name(f.getUpperBound()) +
@@ -221,9 +226,19 @@ struct Emitter {
       }
       line("}");
     } else if (auto y = dyn_cast<scf::YieldOp>(op)) {
-      auto parent = dyn_cast<scf::IfOp>(y->getParentOp());
-      for (unsigned k = 0; parent && k < y.getNumOperands(); ++k)
-        line(name(parent.getResult(k)) + " = " + operand(k) + ";");
+      if (auto parent = dyn_cast<scf::IfOp>(y->getParentOp())) {
+        for (unsigned k = 0; k < y.getNumOperands(); ++k)
+          line(name(parent.getResult(k)) + " = " + operand(k) + ";");
+      } else if (auto loop = dyn_cast<scf::ForOp>(y->getParentOp())) {
+        std::vector<std::string> temps;
+        for (unsigned k = 0; k < y.getNumOperands(); ++k) {
+          std::string t = fresh();
+          line("const " + type(y.getOperand(k).getType()) + " " + t + " = " + operand(k) + ";");
+          temps.push_back(t);
+        }
+        for (unsigned k = 0; k < y.getNumOperands(); ++k)
+          line(name(loop.getRegionIterArgs()[k]) + " = " + temps[k] + ";");
+      }
     } else if (isa<gpu::ReturnOp>(op)) {
     } else {
       err = "Metal emitter: unsupported op " + opname;

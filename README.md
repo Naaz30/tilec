@@ -69,14 +69,34 @@ Exposed as kernel parameters and applied by the host code in `ext.py`:
 
 ## Future work
 
-- **Loop-carried values.** Support `scf.for` `iter_args` so accumulators can live in registers across runtime loops. This enables the next item.
-- **Reduction deferral.** Accumulate partial products per thread across all chunks and perform a single cross-thread reduction per output, instead of a full SIMD + threadgroup reduction (with barriers) for every chunk.
-- **Loop interchange and register tiling for matmul.** Reorder loops so one loaded `x2` chunk is reused across all coarsened rows, giving an outer-product formulation with reuse of both operands in registers.
-- **Threadgroup-memory tiling.** Cooperative loads of `x1`/`x2` tiles into threadgroup memory, with software pipelining (double buffering) to overlap loads with compute.
-- **Matrix intrinsics.** Lower tile matmuls to Apple's `simdgroup_matrix` (8×8 SIMD-group matrix multiply-accumulate).
-- **Vectorized memory access.** Widen contiguous per-thread accesses to `float4` loads and stores.
-- **Barrier elimination.** Remove redundant `threadgroup_barrier`s (back-to-back or with no intervening shared-memory access).
-- **A tile-level dialect.** Keep tiles and their layouts as first-class types in MLIR (as Triton's TritonGPU dialect does), so layout propagation, layout conversion, split-K and coarsening become IR rewrites instead of hand-written kernel variants.
+The matmul optimizations below follow the sequence in Simon Boehm's [How to Optimize a CUDA Matmul Kernel](https://siboehm.com/articles/22/CUDA-MMM), mapped to Apple GPUs (warp → SIMD-group, shared memory → threadgroup memory, tensor cores → `simdgroup_matrix`). The goal is for the compiler to apply them, so op authors write block-level tile code and never write these variants by hand.
+
+### Language and IR prerequisites
+
+- **2-D tiles.** Tiles of shape `BM × BK`, with layouts that map a 2-D tile onto the threads of a threadgroup.
+- **Loop-carried values.** `scf.for` `iter_args`, so accumulators can live in registers across runtime loops.
+- **`tl.dot`.** A block-level matrix product on 2-D tiles. It gives the compiler one op to apply the matmul optimizations to, instead of recognizing them in hand-written loops.
+- **A tile-level dialect.** Keep tiles and their layouts as first-class types in MLIR (as Triton's TritonGPU dialect does), so layout propagation, layout conversion and the schedule transformations below become IR rewrites.
+
+### Matmul code generation (in order)
+
+1. **Output-stationary mapping.** Assign output elements to threads, so each thread accumulates its own results and no cross-thread reduction or barrier is needed per output. The current kernel splits each dot product across the threadgroup instead. Every step below assumes this mapping.
+2. **Global-memory coalescing for the new mapping.** Choose the thread-to-output mapping so neighbouring threads read neighbouring addresses of both operands.
+3. **Threadgroup-memory tiling.** Load `BM × BK` and `BK × BN` tiles cooperatively into threadgroup memory and compute from there, so each global load is reused across the tile.
+4. **1-D register blocking.** Each thread computes a column of `TM` outputs, reusing one value from threadgroup memory across them and cutting threadgroup-memory loads per result.
+5. **2-D register blocking.** Each thread computes a `TM × TN` block of outputs as an outer product of register-cached fragments, raising arithmetic intensity further.
+6. **Vectorized memory access.** `float4` loads and stores from device memory, and storing the `A` tile transposed in threadgroup memory so its reads are also vectorized.
+7. **Bank-conflict avoidance.** Pad or swizzle threadgroup-memory tiles so threads of a SIMD-group hit different banks.
+8. **SIMD-group tiling.** A tiling level between the threadgroup tile and the thread tile, so each SIMD-group owns a sub-tile. This matches Apple's scheduling unit and is the layout `simdgroup_matrix` needs.
+9. **Matrix instructions.** Lower SIMD-group tiles to `simdgroup_matrix` 8×8 multiply-accumulate.
+10. **Software pipelining.** Double-buffer threadgroup-memory tiles so the next tile is loaded while the current one is computed.
+11. **Threadgroup swizzling.** Reorder the threadgroup launch order so concurrently running threadgroups share input tiles in the cache.
+12. **Tuning the new parameters.** Extend the config space and the trained model to `BM`, `BN`, `BK`, `TM`, `TN` and the SIMD-group tile.
+
+### Other
+
+- **Reduction deferral.** For reductions, accumulate across all chunks per thread and perform a single cross-thread reduction per output, instead of a SIMD + threadgroup reduction (with barriers) for every chunk.
+- **Barrier elimination.** Remove redundant `threadgroup_barrier`s (back-to-back or with no intervening threadgroup-memory access).
 - **Multi-dimensional grids.** `tl.program_id(1)` to run split-K in a single launch, with the combine fused into the kernel (atomics or a last-block reduction).
 - **Segmented reductions.** Reduce several short rows within one threadgroup in parallel, so coarsened short rows keep all threads busy.
 - **Finer alias analysis.** Replace the argument-level no-alias assumption with access-range analysis, so loads can be hoisted even when the same buffer is also written.

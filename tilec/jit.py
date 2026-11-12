@@ -82,7 +82,8 @@ def _launch(ck, grid, args):
     packed = [torch.tensor([a], dtype=torch.int32, device="mps") if isinstance(a, int) else a
               for a in args]                                   
     threads = NUM_WARPS * 32
-    kernel(*packed, threads=[grid[0] * threads, 1, 1], group_size=[threads, 1, 1])
+    gx, gy, gz = (tuple(grid) + (1, 1))[:3]
+    kernel(*packed, threads=[gx * threads, gy, gz], group_size=[threads, 1, 1])
 
 
 def jit(fn):

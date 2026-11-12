@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyTuple};
 
 use crate::ir::{Attr, Elem, Function, Type};
 use crate::CompileError;
@@ -44,6 +44,26 @@ fn py_to_val<'py>(obj: Bound<'py, PyAny>) -> PyResult<Val<'py>> {
         return Ok(Val::Float(obj.extract()?));
     }
     Ok(Val::Obj(obj))
+}
+
+fn assigned_names(body: &Bound<'_, PyAny>, out: &mut Vec<String>) -> PyResult<()> {
+    for stmt in body.try_iter()? {
+        let stmt = stmt?;
+        match kind(&stmt)?.as_str() {
+            "Assign" => {
+                let target = stmt.getattr("targets")?.get_item(0)?;
+                if kind(&target)? == "Name" {
+                    let name: String = target.getattr("id")?.extract()?;
+                    if !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+            }
+            "For" => assigned_names(&stmt.getattr("body")?, out)?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn broadcast_shapes(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
@@ -145,22 +165,85 @@ impl<'py> FrontEnd<'py> {
 
     fn visit_runtime_for(&mut self, node: &Bound<'py, PyAny>, it: &Bound<'py, PyAny>) -> PyResult<()> {
         let args = it.getattr("args")?;
-        let n = self.eval(&args.get_item(0)?)?;
-        let end = self.to_value(n, None, node)?;
-        let start = self.func.emit("constant", vec![], Some(Type::scalar(Elem::I32)),
-                           vec![("value", Attr::Int(0))]).unwrap();
-        let iv = self.func.emit("loop_begin", vec![start, end], Some(Type::scalar(Elem::I32)), vec![]).unwrap();
-
+        let mut bounds = Vec::new();
+        for a in args.try_iter()? {
+            bounds.push(self.eval(&a?)?);
+        }
+        let (start, stop, step) = match bounds.len() {
+            1 => (Val::Int(0), bounds[0].clone(), Val::Int(1)),
+            2 => (bounds[0].clone(), bounds[1].clone(), Val::Int(1)),
+            3 => (bounds[0].clone(), bounds[1].clone(), bounds[2].clone()),
+            _ => return Err(self.error(node, "range takes 1 to 3 arguments")),
+        };
+        if let Val::Int(s) = step {
+            if s <= 0 {
+                return Err(self.error(node, "range step must be positive"));
+            }
+        }
+        let start = self.to_value(start, None, node)?;
+        let end = self.to_value(stop, None, node)?;
+        let step = self.to_value(step, None, node)?;
+        for v in [start, end, step] {
+            if *self.func.ty(v) != Type::scalar(Elem::I32) {
+                return Err(self.error(node, "range bounds must be integers"));
+            }
+        }
         let target: String = node.getattr("target")?.getattr("id")?.extract()?;
+
+        let mut assigned = Vec::new();
+        assigned_names(&node.getattr("body")?, &mut assigned)?;
+        let carried: Vec<String> = assigned.into_iter()
+            .filter(|n| *n != target && self.env.contains_key(n))
+            .collect();
+        let mut inits = Vec::new();
+        for name in &carried {
+            let init = match self.env[name].clone() {
+                Val::V(v) => v,
+                Val::Obj(_) => return Err(self.error(node, &format!("'{name}' cannot be reassigned inside a runtime loop"))),
+                c => self.to_value(c, None, node)?,
+            };
+            inits.push(init);
+        }
+
+        let mut operands = vec![start, end, step];
+        operands.extend(&inits);
+        let iv = self.func.emit("loop_begin", operands, Some(Type::scalar(Elem::I32)), vec![]).unwrap();
         let saved = self.env.clone();
-        self.loop_outer.push(saved.keys().cloned().collect());   
+        self.loop_outer.push(saved.keys().cloned().collect());
+        let mut loop_args = Vec::new();
+        for (k, (name, init)) in carried.iter().zip(&inits).enumerate() {
+            let ty = self.func.ty(*init).clone();
+            let a = self.func.emit("loop_arg", vec![], Some(ty), vec![("index", Attr::Int(k as i64))]).unwrap();
+            self.env.insert(name.clone(), Val::V(a));
+            loop_args.push(a);
+        }
         self.env.insert(target, Val::V(iv));
         for stmt in node.getattr("body")?.try_iter()? {
             self.visit_stmt(&stmt?)?;
         }
-        self.loop_outer.pop();                                    
-        self.func.emit("loop_end", vec![], None, vec![]);
+
+        let mut yields = Vec::new();
+        for (name, a) in carried.iter().zip(&loop_args) {
+            let new = match self.env[name].clone() {
+                Val::V(v) => v,
+                Val::Obj(_) => return Err(self.error(node, &format!("'{name}' cannot be reassigned inside a runtime loop"))),
+                c => self.to_value(c, Some(*a), node)?,
+            };
+            let (before, after) = (self.func.ty(*a).clone(), self.func.ty(new).clone());
+            if before != after {
+                return Err(self.error(node, &format!(
+                    "'{name}' changes type inside the loop ({before} before, {after} after); give it its final shape before the loop")));
+            }
+            yields.push(new);
+        }
+        self.loop_outer.pop();
+        self.func.emit("loop_end", yields, None, vec![]);
         self.env = saved;
+        for (k, (name, a)) in carried.iter().zip(&loop_args).enumerate() {
+            let ty = self.func.ty(*a).clone();
+            let r = self.func.emit("loop_result", vec![*a], Some(ty), vec![("index", Attr::Int(k as i64))]).unwrap();
+            self.env.insert(name.clone(), Val::V(r));
+        }
         Ok(())
     }
 
@@ -200,6 +283,7 @@ impl<'py> FrontEnd<'py> {
                 let op = match kind(&node.getattr("op")?)?.as_str() {
                     "Add" => "add",
                     "Mult" => "mul",
+                    "BitAnd" => "and",
                     other => return Err(self.error(node, &format!("unsupported operator {other}"))),
                 };
                 let a = self.eval(&node.getattr("left")?)?;
@@ -216,6 +300,17 @@ impl<'py> FrontEnd<'py> {
                 self.compare("lt", a, b, node)
             }
             "Call" => self.eval_call(node),
+            "Tuple" => {
+                let mut items = Vec::new();
+                for e in node.getattr("elts")?.try_iter()? {
+                    match self.eval(&e?)? {
+                        Val::Int(i) => items.push(i),
+                        _ => return Err(self.error(node, "only tuples of compile-time integers are supported")),
+                    }
+                }
+                Ok(Val::Obj(PyTuple::new(node.py(), items)?.into_any()))
+            }
+            "Subscript" => self.subscript(node),
             other => Err(self.error(node, &format!("unsupported expression: {other}"))),
         }
     }
@@ -244,10 +339,39 @@ impl<'py> FrontEnd<'py> {
         match name.as_str() {
             "program_id" => {
                 let axis = match arg(0, "axis") { Some(Val::Int(a)) => a, None => 0, _ => -1 };
-                if axis != 0 {
-                    return Err(self.error(node, "only tl.program_id(0) is supported"));
+                if !(0..3).contains(&axis) {
+                    return Err(self.error(node, "tl.program_id takes axis 0, 1 or 2"));
                 }
-                Ok(self.v("program_id", vec![], Type::scalar(Elem::I32), vec![("axis", Attr::Int(0))]))
+                Ok(self.v("program_id", vec![], Type::scalar(Elem::I32), vec![("axis", Attr::Int(axis))]))
+            }
+            "zeros" => {
+                let shape: Vec<usize> = match arg(0, "shape") {
+                    Some(Val::Int(n)) if n > 0 => vec![n as usize],
+                    Some(Val::Obj(t)) => t.extract::<Vec<i64>>()
+                        .map_err(|_| self.error(node, "tl.zeros needs a compile-time shape"))?
+                        .into_iter().map(|n| n as usize).collect(),
+                    _ => return Err(self.error(node, "tl.zeros needs a compile-time shape")),
+                };
+                if shape.iter().any(|&n| n == 0 || n & (n - 1) != 0) {
+                    return Err(self.error(node, &format!("tl.zeros dimensions must be powers of two (got {shape:?})")));
+                }
+                let z = self.func.emit("constant", vec![], Some(Type::scalar(Elem::F32)),
+                                       vec![("value", Attr::Float(0.0))]).unwrap();
+                Ok(Val::V(self.broadcast_to(z, &shape, node)?))
+            }
+            "dot" => {
+                let (Some(Val::V(a)), Some(Val::V(b))) = (arg(0, "a"), arg(1, "b")) else {
+                    return Err(self.error(node, "use tl.dot(a, b) with two 2-D tiles"));
+                };
+                let (ta, tb) = (self.func.ty(a).clone(), self.func.ty(b).clone());
+                if ta.shape.len() != 2 || tb.shape.len() != 2 || ta.shape[1] != tb.shape[0] {
+                    return Err(self.error(node, &format!("tl.dot needs (M, K) and (K, N) tiles, got {ta} and {tb}")));
+                }
+                if ta.elem != Elem::F32 || tb.elem != Elem::F32 || ta.ptr || tb.ptr {
+                    return Err(self.error(node, "tl.dot needs float tiles"));
+                }
+                let ty = Type { elem: Elem::F32, ptr: false, shape: vec![ta.shape[0], tb.shape[1]] };
+                Ok(self.v("dot", vec![a, b], ty, vec![]))
             }
             "arange" => {
                 let (Some(Val::Int(start)), Some(Val::Int(end))) = (arg(0, "start"), arg(1, "end")) else {
@@ -282,11 +406,18 @@ impl<'py> FrontEnd<'py> {
             }
             "store" => {
                 let (Some(Val::V(ptr)), Some(value)) = (arg(0, "pointer"), arg(1, "value")) else {
-                    return Err(self.error(node, "use tl.store(pointer, value)"));
+                    return Err(self.error(node, "use tl.store(pointer, value, mask=...)"));
                 };
+                let mask = arg(2, "mask");
                 let value = self.to_value(value, None, node)?;
                 let (ptr, value) = self.broadcast_pair(ptr, value, node)?;
-                self.func.emit("store", vec![ptr, value], None, vec![]);
+                let mut operands = vec![ptr, value];
+                if let Some(mask) = mask {
+                    let Val::V(mask) = mask else { return Err(self.error(node, "mask must be a tensor")) };
+                    let shape = self.func.ty(ptr).shape.clone();
+                    operands.push(self.broadcast_to(mask, &shape, node)?);
+                }
+                self.func.emit("store", operands, None, vec![]);
                 Ok(Val::Obj(node.py().None().into_bound(node.py())))
             }
             "sum" => {
@@ -355,7 +486,10 @@ impl<'py> FrontEnd<'py> {
     fn binary(&mut self, op: &'static str, a: Val<'py>, b: Val<'py>, node: &Bound<'py, PyAny>) -> PyResult<Val<'py>> {
         let num = |v: &Val| match v { Val::Int(i) => Some(*i as f64), Val::Float(f) => Some(*f), _ => None };
         match (&a, &b) {
-            (Val::Int(x), Val::Int(y)) => return Ok(Val::Int(if op == "add" { x + y } else { x * y })),
+            (Val::Int(x), Val::Int(y)) => return Ok(Val::Int(match op { "add" => x + y, "mul" => x * y, _ => x & y })),
+            _ if op == "and" && num(&a).is_some() && num(&b).is_some() => {
+                return Err(self.error(node, "& needs integers or masks"));
+            }
             _ if num(&a).is_some() && num(&b).is_some() => {
                 let (x, y) = (num(&a).unwrap(), num(&b).unwrap());
                 return Ok(Val::Float(if op == "add" { x + y } else { x * y }));
@@ -380,9 +514,47 @@ impl<'py> FrontEnd<'py> {
         if self.func.ty(a).elem != self.func.ty(b).elem {
             return Err(self.error(node, &format!("mixed types {} and {}", self.func.ty(a), self.func.ty(b))));
         }
+        if op == "and" && self.func.ty(a).elem == Elem::F32 {
+            return Err(self.error(node, "& needs integers or masks"));
+        }
         let (a, b) = self.broadcast_pair(a, b, node)?;
         let ty = self.func.ty(a).clone();
         Ok(self.v("binary", vec![a, b], ty, vec![("kind", Attr::Str(op))]))
+    }
+
+    fn subscript(&mut self, node: &Bound<'py, PyAny>) -> PyResult<Val<'py>> {
+        let Val::V(mut x) = self.eval(&node.getattr("value")?)? else {
+            return Err(self.error(node, "only tiles can be indexed"));
+        };
+        let index = node.getattr("slice")?;
+        let parts: Vec<Bound<'py, PyAny>> = if kind(&index)? == "Tuple" {
+            index.getattr("elts")?.try_iter()?.collect::<PyResult<_>>()?
+        } else {
+            vec![index]
+        };
+        let rank = self.func.ty(x).shape.len();
+        let mut dim = 0;
+        let mut kept = 0;
+        for p in &parts {
+            match kind(p)?.as_str() {
+                "Slice" if p.getattr("lower")?.is_none() && p.getattr("upper")?.is_none()
+                           && p.getattr("step")?.is_none() => {
+                    dim += 1;
+                    kept += 1;
+                }
+                "Constant" if p.getattr("value")?.is_none() => {
+                    let mut ty = self.func.ty(x).clone();
+                    ty.shape.insert(dim, 1);
+                    x = self.func.emit("expand_dims", vec![x], Some(ty), vec![("axis", Attr::Int(dim as i64))]).unwrap();
+                    dim += 1;
+                }
+                _ => return Err(self.error(node, "only x[:, None] and x[None, :] style indexing is supported")),
+            }
+        }
+        if kept != rank {
+            return Err(self.error(node, &format!("indexing a {rank}-D tile needs {rank} `:`")));
+        }
+        Ok(Val::V(x))
     }
 
     fn compare(&mut self, op: &'static str, a: Val<'py>, b: Val<'py>, node: &Bound<'py, PyAny>) -> PyResult<Val<'py>> {
