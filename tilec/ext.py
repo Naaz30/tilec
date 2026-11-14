@@ -34,21 +34,6 @@ def _col_sum_kernel(x_ptr, out_ptr, M, N, BLOCK: tl.constexpr):
         acc_t = acc_t + tl.load(x_ptr + i * N + cols, mask=cols < N, other=0.0)
     tl.store(out_ptr + cols, acc_t)
 
-@jit
-def _matrix_mul(x1, x2, out_ptr, N, M2, ROW0, COL0, LEN, OUT0,
-                BLOCK: tl.constexpr, CHUNKS: tl.constexpr, ROWS: tl.constexpr):
-    pid = tl.program_id(0)
-    cols0 = tl.arange(0, BLOCK)
-    for i in tl.static_range(ROWS):
-        row = ROW0 + pid * ROWS + i
-        for r2 in range(M2):
-            acc_t = tl.load(x1 + row * N + COL0 + cols0, mask=cols0 < 0, other=0.0)
-            for c in tl.static_range(CHUNKS):
-               cols = c * BLOCK + cols0
-               v1 = tl.load(x1 + row * N + COL0 + cols, mask=cols < LEN, other=0.0)
-               v2 = tl.load(x2 + r2 * N + COL0 + cols, mask=cols < LEN, other=0.0)
-               acc_t = acc_t + tl.mul(v1,v2)
-            tl.store(out_ptr + OUT0 + row * M2 + r2, tl.sum(acc_t))
 
 @jit
 def _matmul_tiled(a, b, c, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):

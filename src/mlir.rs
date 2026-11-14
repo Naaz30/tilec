@@ -115,7 +115,49 @@ impl<'a> Gen<'a> {
         self.remember(key, v)
     }
 
+    fn patch(&self, shape: &[usize]) -> Option<(usize, usize, usize)> {
+        if shape.len() != 2 {
+            return None;
+        }
+        let (rows, cols) = (shape[0], shape[1]);
+        let numel = rows * cols;
+        if numel < self.threads || numel % self.threads != 0 {
+            return None;
+        }
+        let per = numel / self.threads;
+        let pc = 4.min(cols).min(per);
+        let pr = per / pc;
+        if per % pc != 0 || cols % pc != 0 || rows % pr != 0 || (rows / pr) * (cols / pc) != self.threads {
+            return None;
+        }
+        Some((pr, pc, cols / pc))
+    }
+
     fn coords(&mut self, shape: &[usize], k: usize) -> Vec<String> {
+        if let Some((pr, pc, across)) = self.patch(shape) {
+            let (a, b) = (k / pc, k % pc);
+            let mut out = Vec::new();
+            for (i, (size, step, offset)) in [(pr, across, a), (pc, across, b)].into_iter().enumerate() {
+                let key = format!("patch:{shape:?}:{k}:{i}");
+                if let Some(v) = self.lookup(&key) {
+                    out.push(v);
+                    continue;
+                }
+                let tid = self.tid();
+                let s = self.int(step as i64);
+                let t = if i == 0 {
+                    self.op(format!("arith.divui {tid}, {s} : i32"))
+                } else {
+                    self.op(format!("arith.remui {tid}, {s} : i32"))
+                };
+                let z = self.int(size as i64);
+                let base = self.op(format!("arith.muli {t}, {z} : i32"));
+                let o = self.int(offset as i64);
+                let c = self.op(format!("arith.addi {base}, {o} : i32"));
+                out.push(self.remember(key, c));
+            }
+            return out;
+        }
         let numel: usize = shape.iter().product();
         let e = self.flat(numel, k);
         let mut out = Vec::new();
@@ -606,8 +648,16 @@ impl<'a> Gen<'a> {
             }
             None => None,
         };
+        let shape = self.f.ty(v).shape.clone();
         for k in 0..self.regs(v)? {
-            let e = self.flat(numel, k);
+            let e = if self.patch(&shape).is_some() {
+                let cs = self.coords(&shape, k);
+                let w = self.int(shape[1] as i64);
+                let r = self.op(format!("arith.muli {}, {w} : i32", cs[0]));
+                self.op(format!("arith.addi {r}, {} : i32", cs[1]))
+            } else {
+                self.flat(numel, k)
+            };
             let i = self.to_index(&e);
             let x = self.slot(v, k);
             let st = format!("memref.store {x}, {buf}[{i}] : {wty}");
