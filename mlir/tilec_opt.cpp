@@ -88,8 +88,13 @@ struct Emitter {
     if (t.isF32()) return "float";
     if (t.isInteger(1)) return "bool";
     if (t.isInteger(32) || t.isIndex()) return "int";
-    if (auto v = dyn_cast<VectorType>(t))
-      if (v.getRank() == 1 && v.getElementType().isF32() && v.getNumElements() == 4) return "float4";
+    if (auto v = dyn_cast<VectorType>(t)) {
+      int64_t n = v.getNumElements();
+      if (v.getRank() == 1 && (n == 1 || n == 2 || n == 4)) {
+        std::string el = type(v.getElementType());
+        return n == 1 ? el : el + std::to_string(n);
+      }
+    }
     std::string s;
     llvm::raw_string_ostream os(s);
     t.print(os);
@@ -186,9 +191,14 @@ struct Emitter {
     } else if (auto ld = dyn_cast<memref::LoadOp>(op)) {
       define(ld.getResult(), name(ld.getMemRef()) + "[" + name(ld.getIndices()[0]) + "]");
     } else if (auto vl = dyn_cast<vector::LoadOp>(op)) {
-      define(vl.getResult(), "*(device const float4*)(" + name(vl.getBase()) + " + " + name(vl.getIndices()[0]) + ")");
+      std::string space = cast<MemRefType>(vl.getBase().getType()).getMemorySpace() ? "threadgroup " : "device const ";
+      define(vl.getResult(), "*(" + space + type(vl.getResult().getType()) + "*)(" + name(vl.getBase()) + " + " + name(vl.getIndices()[0]) + ")");
     } else if (auto ex = dyn_cast<vector::ExtractOp>(op)) {
-            define(ex.getResult(), name(ex->getOperand(0)) + "[" + std::to_string(ex.getStaticPosition()[0]) + "]");
+      std::string src = name(ex->getOperand(0));
+      if (cast<VectorType>(ex->getOperand(0).getType()).getNumElements() == 1)
+        define(ex.getResult(), src);
+      else
+        define(ex.getResult(), src + "[" + std::to_string(ex.getStaticPosition()[0]) + "]");
     } else if (auto st = dyn_cast<memref::StoreOp>(op)) {
       line(name(st.getMemRef()) + "[" + name(st.getIndices()[0]) + "] = " + name(st.getValue()) + ";"); }
       else if (auto f = dyn_cast<scf::ForOp>(op)) {
@@ -280,7 +290,7 @@ struct Emitter {
       auto mt = cast<MemRefType>(wg.getType());
       std::string n = "red" + std::to_string(k);
       names[wg] = n;
-      line("threadgroup " + type(mt.getElementType()) + " " + n + "[" + std::to_string(mt.getNumElements()) + "];");
+      line("alignas(16) threadgroup " + type(mt.getElementType()) + " " + n + "[" + std::to_string(mt.getNumElements()) + "];");
     }
     if (!emitBlock(func.getBody().front())) return false;
     out += "}\n";

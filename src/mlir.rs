@@ -614,71 +614,74 @@ impl<'a> Gen<'a> {
         let e = mty(self.f.ty(r).elem);
         let shape = self.f.ty(r).shape.clone();
 
-        if e == "f32" && matches!(self.patch(&shape), Some((_, 4, _))) {
-            let mut slots = Vec::new();
-            for j in 0..self.regs(r)? / 4 {
-                let (mut safes, mut is, mut ms, mut os) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                for it in 0..4 {
-                    let k = 4 * j + it;
-                    let (p, m, o) = (self.operand(ptr, &shape, k)?, self.operand(mask, &shape, k)?, self.operand(other, &shape, k)?);
-                    let safe = self.op(format!("arith.select {m}, {p}, %zero : i32"));
-                    let i = self.to_index(&safe);
-                    safes.push(safe);
-                    is.push(i);
-                    ms.push(m);
-                    os.push(o);
-                }
-
-                let mut ok = ms[0].clone();
-                for it in 1..4 {
-                    ok = self.op(format!("arith.andi {ok}, {} : i1", ms[it]));
-                    let step = self.int(it as i64);
-                    let want = self.op(format!("arith.addi {}, {step} : i32", safes[0]));
-                    let same = self.op(format!("arith.cmpi eq, {}, {want} : i32", safes[it]));
-                    ok = self.op(format!("arith.andi {ok}, {same} : i1"));
-                }
-                let four = self.int(4);
-                let rem = self.op(format!("arith.remui {}, {four} : i32", safes[0]));
-                let aligned = self.op(format!("arith.cmpi eq, {rem}, %zero : i32"));
-                ok = self.op(format!("arith.andi {ok}, {aligned} : i1"));
-
-                let res = self.fresh();
-                self.line(format!("{res}:4 = scf.if {ok} -> (f32, f32, f32, f32) {{"));
-                self.depth += 1;
-                let x = self.op(format!("vector.load {base}[{}] : memref<?xf32>, vector<4xf32>", is[0]));
-                let mut vals = Vec::new();
-                for it in 0..4 {
-                    let xi = self.op(format!("vector.extract {x}[{it}] : f32 from vector<4xf32>"));
-                    vals.push(self.op(format!("arith.select {}, {xi}, {} : f32", ms[it], os[it])));
-                }
-                self.line(format!("scf.yield {} : f32, f32, f32, f32", vals.join(", ")));
-                self.depth -= 1;
-                self.line("} else {".to_string());
-                self.depth += 1;
-                let mut vals = Vec::new();
-                for it in 0..4 {
-                    let x = self.op(format!("memref.load {base}[{}] : memref<?xf32>", is[it]));
-                    vals.push(self.op(format!("arith.select {}, {x}, {} : f32", ms[it], os[it])));
-                }
-                self.line(format!("scf.yield {} : f32, f32, f32, f32", vals.join(", ")));
-                self.depth -= 1;
-                self.line("}".to_string());
-
-                for it in 0..4 {
-                    slots.push(format!("{res}#{it}"));
-                }
+        for o in [ptr, mask, other] {
+            if self.f.ty(o).shape != shape {
+                return Err(CompileError::new_err("load operands must have the load's shape"));
             }
-            self.names.insert(r, slots);
-            Ok(())
-        } else {
-            self.each(r, |g, k| {
-                let (p, m, o) = (g.operand(ptr, &shape, k)?, g.operand(mask, &shape, k)?, g.operand(other, &shape, k)?);
-                let safe = g.op(format!("arith.select {m}, {p}, %zero : i32"));
-                let i = g.to_index(&safe);
-                let x = g.op(format!("memref.load {base}[{i}] : memref<?x{e}>"));
-                Ok(g.op(format!("arith.select {m}, {x}, {o} : {e}")))
-            })
         }
+
+        let w = match self.patch(&shape) {
+            Some((_, pc, _)) if pc == 2 || pc == 4 => pc,
+            _ => 1,
+        };
+        let vty = format!("vector<{w}x{e}>");
+        let tys = vec![e; w].join(", ");
+
+        let mut slots = Vec::new();
+        for j in 0..self.regs(r)? / w {
+            let (mut safes, mut is, mut ms, mut os) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for it in 0..w {
+                let k = w * j + it;
+                let (p, m, o) = (self.slot(ptr, k), self.slot(mask, k), self.slot(other, k));
+                let safe = self.op(format!("arith.select {m}, {p}, %zero : i32"));
+                let i = self.to_index(&safe);
+                safes.push(safe);
+                is.push(i);
+                ms.push(m);
+                os.push(o);
+            }
+
+            let mut ok = ms[0].clone();
+            for it in 1..w {
+                ok = self.op(format!("arith.andi {ok}, {} : i1", ms[it]));
+                let step = self.int(it as i64);
+                let want = self.op(format!("arith.addi {}, {step} : i32", safes[0]));
+                let same = self.op(format!("arith.cmpi eq, {}, {want} : i32", safes[it]));
+                ok = self.op(format!("arith.andi {ok}, {same} : i1"));
+            }
+            let width = self.int(w as i64);
+            let rem = self.op(format!("arith.remui {}, {width} : i32", safes[0]));
+            let aligned = self.op(format!("arith.cmpi eq, {rem}, %zero : i32"));
+            ok = self.op(format!("arith.andi {ok}, {aligned} : i1"));
+
+            let res = self.fresh();
+            self.line(format!("{res}:{w} = scf.if {ok} -> ({tys}) {{"));
+            self.depth += 1;
+            let x = self.op(format!("vector.load {base}[{}] : memref<?x{e}>, {vty}", is[0]));
+            let mut vals = Vec::new();
+            for it in 0..w {
+                let xi = self.op(format!("vector.extract {x}[{it}] : {e} from {vty}"));
+                vals.push(self.op(format!("arith.select {}, {xi}, {} : {e}", ms[it], os[it])));
+            }
+            self.line(format!("scf.yield {} : {tys}", vals.join(", ")));
+            self.depth -= 1;
+            self.line("} else {".to_string());
+            self.depth += 1;
+            let mut vals = Vec::new();
+            for it in 0..w {
+                let x = self.op(format!("memref.load {base}[{}] : memref<?x{e}>", is[it]));
+                vals.push(self.op(format!("arith.select {}, {x}, {} : {e}", ms[it], os[it])));
+            }
+            self.line(format!("scf.yield {} : {tys}", vals.join(", ")));
+            self.depth -= 1;
+            self.line("}".to_string());
+
+            for it in 0..w {
+                slots.push(format!("{res}#{it}"));
+            }
+        }
+        self.names.insert(r, slots);
+        Ok(())
     }
 
     fn op_store(&mut self, op: &Op) -> PyResult<()> {
@@ -721,7 +724,7 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    fn stage(&mut self, v: usize, buf: &str, wty: &str) -> PyResult<()> {
+    fn stage(&mut self, v: usize, buf: &str, wty: &str, transpose: bool) -> PyResult<()> {
         let numel = self.f.ty(v).numel();
         let owner = match self.replicated(v) {
             Some(n) => {
@@ -733,7 +736,12 @@ impl<'a> Gen<'a> {
         };
         let shape = self.f.ty(v).shape.clone();
         for k in 0..self.regs(v)? {
-            let e = if self.patch(&shape).is_some() {
+            let e = if transpose {
+                let cs = self.coords(&shape, k);
+                let h = self.int(shape[0] as i64);
+                let c = self.op(format!("arith.muli {}, {h} : i32", cs[1]));
+                self.op(format!("arith.addi {c}, {} : i32", cs[0]))
+            } else if self.patch(&shape).is_some() {
                 let cs = self.coords(&shape, k);
                 let w = self.int(shape[1] as i64);
                 let r = self.op(format!("arith.muli {}, {w} : i32", cs[0]));
@@ -769,22 +777,29 @@ impl<'a> Gen<'a> {
         self.workgroup.push(format!("{bbuf} : {bty}"));
 
         self.line("gpu.barrier".to_string());
-        self.stage(a, &abuf, &aty)?;
-        self.stage(b, &bbuf, &bty)?;
+        self.stage(a, &abuf, &aty, true)?;
+        self.stage(b, &bbuf, &bty, false)?;
         self.line("gpu.barrier".to_string());
 
         let shape = vec![bm, bn];
         let n = self.regs(r)?;
-        let mut rows = Vec::new();
-        let mut cols = Vec::new();
-        let bkc = self.int(bk as i64);
-        for k in 0..n {
-            let cs = self.coords(&shape, k);
-            rows.push(self.op(format!("arith.muli {}, {bkc} : i32", cs[0])));
-            cols.push(cs[1].clone());
+        let (pr, pc) = match self.patch(&shape) {
+            Some((pr, pc, _)) => (pr, pc),
+            None => (1, 1),
+        };
+        let wa = [4, 2, 1].into_iter().find(|w| pr % w == 0).unwrap();
+        let wb = [4, 2, 1].into_iter().find(|w| pc % w == 0).unwrap();
+        let groups = n / (pr * pc);
+        let mut row0 = Vec::new();
+        let mut col0 = Vec::new();
+        for g in 0..groups {
+            let cs = self.coords(&shape, g * pr * pc);
+            row0.push(cs[0].clone());
+            col0.push(cs[1].clone());
         }
         let zero = self.float(0.0);
         let (lo, hi, one) = (self.idx(0), self.idx(bk as i64), self.idx(1));
+        let bmc = self.int(bm as i64);
         let bnc = self.int(bn as i64);
         let res = self.fresh();
         let kk = self.fresh();
@@ -795,17 +810,39 @@ impl<'a> Gen<'a> {
         self.line(format!("{lhs} = scf.for {kk} = {lo} to {hi} step {one} iter_args({}) -> ({types}) {{", inits.join(", ")));
         self.depth += 1;
         let kki = self.op(format!("arith.index_cast {kk} : index to i32"));
+        let acol = self.op(format!("arith.muli {kki}, {bmc} : i32"));
         let krow = self.op(format!("arith.muli {kki}, {bnc} : i32"));
-        let mut next = Vec::new();
-        for j in 0..n {
-            let ai = self.op(format!("arith.addi {}, {kki} : i32", rows[j]));
-            let ai = self.to_index(&ai);
-            let av = self.op(format!("memref.load {abuf}[{ai}] : {aty}"));
-            let bi = self.op(format!("arith.addi {krow}, {} : i32", cols[j]));
-            let bi = self.to_index(&bi);
-            let bv = self.op(format!("memref.load {bbuf}[{bi}] : {bty}"));
-            let p = self.op(format!("arith.mulf {av}, {bv} : f32"));
-            next.push(self.op(format!("arith.addf {}, {p} : f32", accs[j])));
+        let mut next = vec![String::new(); n];
+        for g in 0..groups {
+            let a0 = self.op(format!("arith.addi {acol}, {} : i32", row0[g]));
+            let mut avals = Vec::new();
+            for v in 0..pr / wa {
+                let off = self.int((v * wa) as i64);
+                let ai = self.op(format!("arith.addi {a0}, {off} : i32"));
+                let ai = self.to_index(&ai);
+                let x = self.op(format!("vector.load {abuf}[{ai}] : {aty}, vector<{wa}xf32>"));
+                for t in 0..wa {
+                    avals.push(self.op(format!("vector.extract {x}[{t}] : f32 from vector<{wa}xf32>")));
+                }
+            }
+            let b0 = self.op(format!("arith.addi {krow}, {} : i32", col0[g]));
+            let mut bvals = Vec::new();
+            for v in 0..pc / wb {
+                let off = self.int((v * wb) as i64);
+                let bi = self.op(format!("arith.addi {b0}, {off} : i32"));
+                let bi = self.to_index(&bi);
+                let x = self.op(format!("vector.load {bbuf}[{bi}] : {bty}, vector<{wb}xf32>"));
+                for t in 0..wb {
+                    bvals.push(self.op(format!("vector.extract {x}[{t}] : f32 from vector<{wb}xf32>")));
+                }
+            }
+            for ra in 0..pr {
+                for cb in 0..pc {
+                    let j = g * pr * pc + ra * pc + cb;
+                    let p = self.op(format!("arith.mulf {}, {} : f32", avals[ra], bvals[cb]));
+                    next[j] = self.op(format!("arith.addf {}, {p} : f32", accs[j]));
+                }
+            }
         }
         self.line(format!("scf.yield {} : {types}", next.join(", ")));
         self.depth -= 1;
