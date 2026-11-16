@@ -39,12 +39,10 @@ impl Layout {
 
 struct Gen<'a> {
     f: &'a Function,
-    num_warps: usize,
     threads: usize,
     body: Vec<String>,
     shared: Vec<String>,              
     ptr_base: HashMap<usize, String>, 
-    n_reduce: usize,
     depth: usize, 
     loops: Vec<Vec<usize>>,
 }
@@ -159,7 +157,6 @@ impl<'a> Gen<'a> {
                 "addptr" => self.op_addptr(op)?,
                 "load" => self.op_load(op)?,
                 "store" => self.op_store(op)?,
-                "reduce" => self.op_reduce(op)?,
                 "loop_begin" => {
                     let (start, end, step, iv) = (op.operands[0], op.operands[1], op.operands[2], op.result.unwrap());
                     let args: Vec<usize> = self.f.ops[i + 1..].iter()
@@ -305,44 +302,15 @@ impl<'a> Gen<'a> {
         self.emit(format!("for (uint r = 0; r < {}u; ++r) {stmt}", lay.regs()));
         Ok(())
     }
-
-    fn op_reduce(&mut self, op: &Op) -> PyResult<()> {
-        let (x, r) = (op.operands[0], op.result.unwrap());
-        let ct = self.f.ty(x).elem.msl();
-        let lay = self.layout(x)?;
-        let k = self.n_reduce;
-        self.n_reduce += 1;
-        let (acc, scratch, nw) = (format!("acc{k}"), format!("red{k}"), self.num_warps);
-        self.shared.push(format!("threadgroup {ct} {scratch}[{nw}];"));
-        let mut body = format!("{acc} = {acc} + v{x}[r];");
-        if let Some(g) = lay.owner_guard() {          
-            body = format!("if ({g}) {body}");
-        }
-        self.emit(format!("// sum over {} elements", self.f.ty(x).numel()));
-        self.emit(format!("{ct} {acc} = {ct}(0);"));
-        self.emit(format!("for (uint r = 0; r < {}u; ++r) {body}", lay.regs()));     
-        self.emit(format!("{acc} = simd_sum({acc});"));                              
-        self.emit(format!("if (lane == 0u) {scratch}[sg] = {acc};"));               
-        self.emit("threadgroup_barrier(mem_flags::mem_threadgroup);".to_string());
-        self.emit(format!("{acc} = {scratch}[0];"));                                
-        self.emit(format!("for (uint w = 1; w < {nw}u; ++w) {acc} = {acc} + {scratch}[w];"));
-        if self.depth > 0 {
-            self.emit("threadgroup_barrier(mem_flags::mem_threadgroup);".to_string());
-        }
-        self.emit(format!("const {ct} v{r} = {acc};"));
-        Ok(())
-    }
 }
 
 pub fn generate(f: &Function, num_warps: usize) -> PyResult<String> {
     Gen {
         f,
-        num_warps,
         threads: num_warps * SIMD_WIDTH,
         body: vec![],
         shared: vec![],
         ptr_base: HashMap::new(),
-        n_reduce: 0,
         depth: 0,
         loops: vec![],
     }

@@ -26,14 +26,12 @@ fn mty(e: Elem) -> &'static str {
 
 struct Gen<'a> {
     f: &'a Function,
-    num_warps: usize,
     threads: usize,
     body: Vec<String>,
     workgroup: Vec<String>,
     names: HashMap<usize, Vec<String>>,
     base: HashMap<usize, String>,
     tmp: usize,
-    n_reduce: usize,
     depth: usize,
     loops: Vec<Frame>,
     done: Vec<Frame>,
@@ -57,6 +55,10 @@ impl<'a> Gen<'a> {
         let t = self.fresh();
         self.line(format!("{t} = {rhs}"));
         t
+    }
+
+    fn bool(&mut self, v: i64) -> String {
+        self.op(format!("arith.constant {} : i1", v != 0))
     }
 
     fn int(&mut self, v: i64) -> String {
@@ -116,10 +118,15 @@ impl<'a> Gen<'a> {
     }
 
     fn patch(&self, shape: &[usize]) -> Option<(usize, usize, usize)> {
-        if shape.len() != 2 {
+        if shape.len() > 2 {
             return None;
         }
-        let (rows, cols) = (shape[0], shape[1]);
+
+        let (mut rows, mut cols) = (1, 1);
+        if shape.len() == 2 {
+            cols = shape[1];
+        }
+        rows = shape[0];
         let numel = rows * cols;
         if numel < self.threads || numel % self.threads != 0 {
             return None;
@@ -290,8 +297,8 @@ impl<'a> Gen<'a> {
         let mut args = Vec::new();
         let mut arg_names = Vec::new();
         let zero = "%c0".to_string();
-        // bc in metal every kernel argument arrives through a 
-        // numbered buffer in the GPU memory. 
+        // bc in metal every kernel argument arrives through a
+        // numbered buffer in the GPU memory.
         // so every param needs it be a mlir memref
 
         // if its a pointer, names has the offsets
@@ -335,7 +342,7 @@ impl<'a> Gen<'a> {
                 // of tile ir ssa and also creates a mapping in names
                 "constant" => self.op_constant(op),
 
-                // stores the positional values within 0...N 
+                // stores the positional values within 0...N
                 // that that thread is responsible for in names
                 // (all of mlir is generated at thread level)
                 "arange" => self.op_arange(op)?,
@@ -350,7 +357,6 @@ impl<'a> Gen<'a> {
 
                 "load" => self.op_load(op)?,
                 "store" => self.op_store(op)?,
-                "reduce" => self.op_reduce(op)?,
                 "expand_dims" => self.op_expand_dims(op)?,
                 "dot" => self.op_dot(op)?,
                 "loop_begin" => self.op_loop_begin(op)?,
@@ -479,12 +485,12 @@ impl<'a> Gen<'a> {
 
         let e = self.f.ty(r).elem;
         let v = match (op.attr("value"), e) {
-            (Attr::Int(i), Elem::I1) => self.op(format!("arith.constant {} : i1", *i != 0)),
+            (Attr::Int(i), Elem::I1) => self.bool(*i),
             (Attr::Int(i), Elem::I32) => self.int(*i),
             (Attr::Int(i), Elem::F32) => self.float(*i as f64),
             (Attr::Float(x), Elem::F32) => self.float(*x),
             (Attr::Float(x), _) => self.int(*x as i64),
-            (Attr::Str(s), _) => self.op(format!("arith.constant {s} : {}", mty(e))),
+            (Attr::Str(_), _) => unreachable!(),
         };
         self.names.insert(r, vec![v]);
     }
@@ -502,6 +508,22 @@ impl<'a> Gen<'a> {
             let m = self.op(format!("arith.remui {tid}, {c} : i32"));
             let s = self.int(start);
             slots.push(self.op(format!("arith.addi {m}, {s} : i32")));
+        } else if let Some((_, pc, _)) = self.patch(&self.f.ty(r).shape) {
+            let pc_v = self.int(pc as i64);
+            let one = self.int(1);
+            let mut t_start = vec![self.op(format!("arith.muli {tid}, {pc_v} : i32"))];
+
+            for i in 1..pc {
+                let next = self.op(format!("arith.addi {}, {one} : i32", t_start[i - 1]));
+                t_start.push(next);
+            }
+
+            for k in 0..self.regs(r)? / pc {
+                let c = self.int(start + (k * 4 * self.threads) as i64);
+                for i in 0..pc {
+                    slots.push(self.op(format!("arith.addi {}, {c} : i32", t_start[i])));
+                }
+            }
         } else {
             for k in 0..self.regs(r)? {
                 let c = self.int(start + (k * self.threads) as i64);
@@ -509,7 +531,7 @@ impl<'a> Gen<'a> {
             }
         }
 
-        // elements of 0...N that the thread tid 
+        // elements of 0...N that the thread tid
         // is responsible for gets stored in the mapping
         self.names.insert(r, slots);
         Ok(())
@@ -532,8 +554,10 @@ impl<'a> Gen<'a> {
             return Ok(());
         }
 
-        // shaped scalar 
+        // shaped scalar
         let shape = self.f.ty(r).shape.clone();
+
+        // TDO : reconcile element dist with arange
         self.each(r, |g, k| g.operand(src, &shape, k))
     }
 
@@ -589,13 +613,72 @@ impl<'a> Gen<'a> {
         let base = self.base[&ptr].clone();
         let e = mty(self.f.ty(r).elem);
         let shape = self.f.ty(r).shape.clone();
-        self.each(r, |g, k| {
-            let (p, m, o) = (g.operand(ptr, &shape, k)?, g.operand(mask, &shape, k)?, g.operand(other, &shape, k)?);
-            let safe = g.op(format!("arith.select {m}, {p}, %zero : i32"));
-            let i = g.to_index(&safe);
-            let x = g.op(format!("memref.load {base}[{i}] : memref<?x{e}>"));
-            Ok(g.op(format!("arith.select {m}, {x}, {o} : {e}")))
-        })
+
+        if e == "f32" && matches!(self.patch(&shape), Some((_, 4, _))) {
+            let mut slots = Vec::new();
+            for j in 0..self.regs(r)? / 4 {
+                let (mut safes, mut is, mut ms, mut os) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for it in 0..4 {
+                    let k = 4 * j + it;
+                    let (p, m, o) = (self.operand(ptr, &shape, k)?, self.operand(mask, &shape, k)?, self.operand(other, &shape, k)?);
+                    let safe = self.op(format!("arith.select {m}, {p}, %zero : i32"));
+                    let i = self.to_index(&safe);
+                    safes.push(safe);
+                    is.push(i);
+                    ms.push(m);
+                    os.push(o);
+                }
+
+                let mut ok = ms[0].clone();
+                for it in 1..4 {
+                    ok = self.op(format!("arith.andi {ok}, {} : i1", ms[it]));
+                    let step = self.int(it as i64);
+                    let want = self.op(format!("arith.addi {}, {step} : i32", safes[0]));
+                    let same = self.op(format!("arith.cmpi eq, {}, {want} : i32", safes[it]));
+                    ok = self.op(format!("arith.andi {ok}, {same} : i1"));
+                }
+                let four = self.int(4);
+                let rem = self.op(format!("arith.remui {}, {four} : i32", safes[0]));
+                let aligned = self.op(format!("arith.cmpi eq, {rem}, %zero : i32"));
+                ok = self.op(format!("arith.andi {ok}, {aligned} : i1"));
+
+                let res = self.fresh();
+                self.line(format!("{res}:4 = scf.if {ok} -> (f32, f32, f32, f32) {{"));
+                self.depth += 1;
+                let x = self.op(format!("vector.load {base}[{}] : memref<?xf32>, vector<4xf32>", is[0]));
+                let mut vals = Vec::new();
+                for it in 0..4 {
+                    let xi = self.op(format!("vector.extract {x}[{it}] : f32 from vector<4xf32>"));
+                    vals.push(self.op(format!("arith.select {}, {xi}, {} : f32", ms[it], os[it])));
+                }
+                self.line(format!("scf.yield {} : f32, f32, f32, f32", vals.join(", ")));
+                self.depth -= 1;
+                self.line("} else {".to_string());
+                self.depth += 1;
+                let mut vals = Vec::new();
+                for it in 0..4 {
+                    let x = self.op(format!("memref.load {base}[{}] : memref<?xf32>", is[it]));
+                    vals.push(self.op(format!("arith.select {}, {x}, {} : f32", ms[it], os[it])));
+                }
+                self.line(format!("scf.yield {} : f32, f32, f32, f32", vals.join(", ")));
+                self.depth -= 1;
+                self.line("}".to_string());
+
+                for it in 0..4 {
+                    slots.push(format!("{res}#{it}"));
+                }
+            }
+            self.names.insert(r, slots);
+            Ok(())
+        } else {
+            self.each(r, |g, k| {
+                let (p, m, o) = (g.operand(ptr, &shape, k)?, g.operand(mask, &shape, k)?, g.operand(other, &shape, k)?);
+                let safe = g.op(format!("arith.select {m}, {p}, %zero : i32"));
+                let i = g.to_index(&safe);
+                let x = g.op(format!("memref.load {base}[{i}] : memref<?x{e}>"));
+                Ok(g.op(format!("arith.select {m}, {x}, {o} : {e}")))
+            })
+        }
     }
 
     fn op_store(&mut self, op: &Op) -> PyResult<()> {
@@ -731,69 +814,17 @@ impl<'a> Gen<'a> {
         self.names.insert(r, names);
         Ok(())
     }
-
-    fn op_reduce(&mut self, op: &Op) -> PyResult<()> {
-        let (x, r) = (op.operands[0], op.result.unwrap());
-        let el = self.f.ty(x).elem;
-        let e = mty(el);
-        let (add, zero) = if el == Elem::F32 { ("arith.addf", self.float(0.0)) } else { ("arith.addi", self.int(0)) };
-        let k = self.n_reduce;
-        self.n_reduce += 1;
-        let nw = self.num_warps;
-        let wty = format!("memref<{nw}x{e}, #gpu.address_space<workgroup>>");
-        let red = format!("%red{k}");
-        self.workgroup.push(format!("{red} : {wty}"));
-        let tid = self.tid();
-        let owner = match self.replicated(x) {
-            Some(n) => {
-                let c = self.int(n as i64);
-                Some(self.op(format!("arith.cmpi slt, {tid}, {c} : i32")))
-            }
-            None => None,
-        };
-        let mut acc = zero.clone();
-        for s in 0..self.regs(x)? {
-            let mut v = self.slot(x, s);
-            if let Some(o) = &owner {
-                v = self.op(format!("arith.select {o}, {v}, {zero} : {e}"));
-            }
-            acc = self.op(format!("{add} {acc}, {v} : {e}"));
-        }
-        let acc = self.op(format!("gpu.subgroup_reduce add {acc} : ({e}) -> {e}"));
-        let w = self.int(SIMD_WIDTH as i64);
-        let lane = self.op(format!("arith.remui {tid}, {w} : i32"));
-        let sg = self.op(format!("arith.divui {tid}, {w} : i32"));
-        let first = self.op(format!("arith.cmpi eq, {lane}, %zero : i32"));
-        let sgi = self.to_index(&sg);
-        self.line(format!("scf.if {first} {{"));
-        self.line(format!("  memref.store {acc}, {red}[{sgi}] : {wty}"));
-        self.line("}".to_string());
-        self.line("gpu.barrier".to_string());
-        let mut total = self.op(format!("memref.load {red}[%c0] : {wty}"));
-        for w in 1..nw {
-            let i = self.idx(w as i64);
-            let p = self.op(format!("memref.load {red}[{i}] : {wty}"));
-            total = self.op(format!("{add} {total}, {p} : {e}"));
-        }
-        if self.depth > 0 {
-            self.line("gpu.barrier".to_string());
-        }
-        self.names.insert(r, vec![total]);
-        Ok(())
-    }
 }
 
 pub fn generate(f: &Function, num_warps: usize) -> PyResult<String> {
     Gen {
         f,
-        num_warps,
         threads: num_warps * SIMD_WIDTH,
         body: vec![],
         workgroup: vec![],
         names: HashMap::new(),
         base: HashMap::new(),
         tmp: 0,
-        n_reduce: 0,
         depth: 0,
         loops: vec![],
         done: vec![],
@@ -815,7 +846,7 @@ pub fn lower(tool: &str, mlir: &str) -> PyResult<(String, String)> {
     child.stdin.take().unwrap().write_all(mlir.as_bytes())?;
     let out = child.wait_with_output()?;
     if !out.status.success() {
-        return Err(CompileError::new_err(format!("{tool} failed:\n{}\ninput:\n{mlir}",
+        return Err(CompileError::new_err(format!("{tool} failed:\n{}",
                                                  String::from_utf8_lossy(&out.stderr))));
     }
     let text = String::from_utf8_lossy(&out.stdout).into_owned();

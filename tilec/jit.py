@@ -2,7 +2,7 @@ import ast
 import inspect
 import os
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import language as tl
 from ._core import compile as _compile
@@ -31,8 +31,8 @@ def _arg_type(x) -> str:
 @dataclass
 class CompiledKernel:
     name: str
-    ir: str                     
-    msl: str                    
+    ir: str = field(repr=False)
+    msl: str = field(repr=False)
 
 
 class JITFunction:

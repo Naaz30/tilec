@@ -13,6 +13,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 
 #include <cmath>
 #include <cstdio>
@@ -87,6 +88,8 @@ struct Emitter {
     if (t.isF32()) return "float";
     if (t.isInteger(1)) return "bool";
     if (t.isInteger(32) || t.isIndex()) return "int";
+    if (auto v = dyn_cast<VectorType>(t))
+      if (v.getRank() == 1 && v.getElementType().isF32() && v.getNumElements() == 4) return "float4";
     std::string s;
     llvm::raw_string_ostream os(s);
     t.print(os);
@@ -144,9 +147,6 @@ struct Emitter {
     static const std::map<std::string, std::string> fcmp = {
         {"oeq", "=="}, {"one", "!="}, {"olt", "<"}, {"ole", "<="}, {"ogt", ">"}, {"oge", ">="},
         {"ueq", "=="}, {"une", "!="}, {"ult", "<"}, {"ule", "<="}, {"ugt", ">"}, {"uge", ">="}};
-    static const std::map<std::string, std::string> reduce = {
-        {"add", "simd_sum"}, {"mul", "simd_product"}, {"minsi", "simd_min"}, {"maxsi", "simd_max"},
-        {"minimumf", "simd_min"}, {"maximumf", "simd_max"}, {"minnumf", "simd_min"}, {"maxnumf", "simd_max"}};
 
     std::string opname = op->getName().getStringRef().str();
     auto operand = [&](unsigned i) { return name(op->getOperand(i)); };
@@ -181,17 +181,17 @@ struct Emitter {
     } else if (auto b = dyn_cast<gpu::BlockIdOp>(op)) {
       std::string d = b.getDimension() == gpu::Dimension::x ? "x" : b.getDimension() == gpu::Dimension::y ? "y" : "z";
       define(b.getResult(), "int(tgpig." + d + ")");
-    } else if (auto r = dyn_cast<gpu::SubgroupReduceOp>(op)) {
-      std::string k = gpu::stringifyAllReduceOperation(r.getOp()).str();
-      if (!reduce.count(k)) { err = "unsupported subgroup_reduce " + k; return false; }
-      define(r.getResult(), reduce.at(k) + "(" + operand(0) + ")");
     } else if (isa<gpu::BarrierOp>(op)) {
       line("threadgroup_barrier(mem_flags::mem_threadgroup);");
     } else if (auto ld = dyn_cast<memref::LoadOp>(op)) {
       define(ld.getResult(), name(ld.getMemRef()) + "[" + name(ld.getIndices()[0]) + "]");
+    } else if (auto vl = dyn_cast<vector::LoadOp>(op)) {
+      define(vl.getResult(), "*(device const float4*)(" + name(vl.getBase()) + " + " + name(vl.getIndices()[0]) + ")");
+    } else if (auto ex = dyn_cast<vector::ExtractOp>(op)) {
+            define(ex.getResult(), name(ex->getOperand(0)) + "[" + std::to_string(ex.getStaticPosition()[0]) + "]");
     } else if (auto st = dyn_cast<memref::StoreOp>(op)) {
-      line(name(st.getMemRef()) + "[" + name(st.getIndices()[0]) + "] = " + name(st.getValue()) + ";");
-    } else if (auto f = dyn_cast<scf::ForOp>(op)) {
+      line(name(st.getMemRef()) + "[" + name(st.getIndices()[0]) + "] = " + name(st.getValue()) + ";"); }
+      else if (auto f = dyn_cast<scf::ForOp>(op)) {
       for (auto [arg, init, res] : llvm::zip(f.getRegionIterArgs(), f.getInitArgs(), f.getResults())) {
         std::string n = fresh();
         line(type(arg.getType()) + " " + n + " = " + name(init) + ";");
@@ -206,7 +206,7 @@ struct Emitter {
       if (!emitBlock(*f.getBody())) return false;
       --indent;
       line("}");
-    } else if (auto i = dyn_cast<scf::IfOp>(op)) {
+    }else if (auto i = dyn_cast<scf::IfOp>(op)) {
       std::vector<std::string> results;
       for (Value r : i.getResults()) {
         std::string n = fresh();
@@ -290,7 +290,7 @@ struct Emitter {
 
 int main(int argc, char **argv) {
   DialectRegistry registry;
-  registry.insert<arith::ArithDialect, gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect>();
+  registry.insert<arith::ArithDialect, gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect, vector::VectorDialect>();
   MLIRContext ctx(registry);
   ctx.loadAllAvailableDialects();
 

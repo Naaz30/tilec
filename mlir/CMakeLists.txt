@@ -17,5 +17,5 @@ if(NOT LLVM_ENABLE_RTTI)
 endif()
 target_link_libraries(tilec-opt PRIVATE
   MLIRParser MLIRPass MLIRTransforms
-  MLIRArithDialect MLIRGPUDialect MLIRMemRefDialect MLIRSCFDialect
+  MLIRArithDialect MLIRGPUDialect MLIRMemRefDialect MLIRSCFDialect MLIRVectorDialect
   MLIRIR MLIRSupport)

@@ -420,13 +420,6 @@ impl<'py> FrontEnd<'py> {
                 self.func.emit("store", operands, None, vec![]);
                 Ok(Val::Obj(node.py().None().into_bound(node.py())))
             }
-            "sum" => {
-                let Some(Val::V(x)) = arg(0, "input") else {
-                    return Err(self.error(node, "tl.sum needs a tensor"));
-                };
-                let elem = self.func.ty(x).elem;
-                Ok(self.v("reduce", vec![x], Type::scalar(elem), vec![("kind", Attr::Str("sum"))]))
-            }
             "mul" => {
                 let (Some(a), Some(b)) = (arg(0, "x"), arg(1, "y")) else {
                    return Err(self.error(node, "use tl.mul(x, y)"));

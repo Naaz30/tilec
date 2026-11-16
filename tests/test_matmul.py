@@ -1,4 +1,4 @@
-"""tilec: the compiler (no GPU needed) and tilec.ext.sum on the Apple GPU."""
+"""tilec: the compiler (no GPU needed) and tilec.ext.matrix_mul on the Apple GPU."""
 
 import numpy as np
 import pytest
@@ -11,11 +11,10 @@ from tilec import ext
 
 
 def test_compiles_without_gpu():
-    x = torch.zeros(2, 3)                     
-    ck = ext._row_sum_kernel.inspect(x, torch.zeros(2), 3, 0, BLOCK=4, CHUNKS=1, ROWS=1)
-    assert "{kind='sum'} : f32" in ck.ir
-    assert "kernel void _row_sum_kernel(" in ck.msl
-    assert "simd_sum(" in ck.msl
+    a, b, c = torch.zeros(64, 16), torch.zeros(16, 64), torch.zeros(64, 64)
+    ck = ext._matmul_tiled.inspect(a, b, c, 64, 64, 16, BM=64, BN=64, BK=16)
+    assert "dot(" in ck.ir
+    assert "kernel void _matmul_tiled(" in ck.msl
 
 
 def test_compile_error_names_the_line():
@@ -28,16 +27,6 @@ def test_compile_error_names_the_line():
 
 
 needs_gpu = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs an Apple GPU")
-
-
-@needs_gpu
-@pytest.mark.parametrize("shape", [(1, 1), (2, 3), (4, 8), (3, 1000), (37, 5000), (2, 100000)])
-@pytest.mark.parametrize("axis", [0, 1])
-def test_sum(shape, axis):
-    x = torch.randn(*shape, device="mps")
-    got = ext.sum(x, axis)
-    torch.mps.synchronize()
-    np.testing.assert_allclose(got.cpu().numpy(), x.sum(axis).cpu().numpy(), rtol=1e-4, atol=1e-2)
 
 
 @needs_gpu
