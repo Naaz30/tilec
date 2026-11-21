@@ -3,3 +3,4 @@ __pycache__/
 *.so
 mlir/build/
 README.md
+bench/build/

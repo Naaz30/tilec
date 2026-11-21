@@ -1,0 +1,9 @@
+version,description,ms,gflops,max_error
+torch,PyTorch MPS (x1 @ x2),56.867,2416.9,0.00e+00
+tiled,"2-D tiles, threadgroup-memory tiling, tl.dot",442.151,310.8,1.02e-03
+patches,8x4 output patch per thread (2-D register blocking),223.411,615.2,1.02e-03
+float4-loads,float4 loads from device memory,224.214,613.0,1.02e-03
+float4-smem,"float4 reads from threadgroup memory, A transposed",201.598,681.7,1.02e-03
+warp,SIMD-group tiling: 32x32 quadrant per SIMD-group,218.988,627.6,1.02e-03
+subtile,two 4x4 pieces per thread inside the quadrant,198.649,691.9,1.02e-03
+simdgroup,simdgroup_matrix 8x8 multiply-accumulate,206.567,665.3,1.01e-03

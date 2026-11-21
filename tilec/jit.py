@@ -20,6 +20,17 @@ NUM_WARPS = 4
 _LIBRARIES: dict = {}
 
 
+
+# Note: the compiler (or user) chooses the number of WARPS per threadgroup, not a raw
+# thread count: threads per threadgroup = NUM_WARPS * 32.
+# A warp (Metal: SIMD-group) is the group of threads the GPU runs in lockstep;
+# it is 32 threads on all Apple GPUs (and NVIDIA), fixed by the hardware.
+# Metal would accept any thread count, but anything other than a multiple of 32
+# leaves idle lanes in the last warp, so we always launch whole warps.
+# The total number of warps is (number of threadgroups in the grid) * NUM_WARPS.
+# https://developer.apple.com/metal/limits
+
+
 def _arg_type(x) -> str:
     if str(getattr(x, "dtype", "")) == "torch.float32":
         return "ptr<f32>"
@@ -83,6 +94,14 @@ def _launch(ck, grid, args):
               for a in args]                                   
     threads = NUM_WARPS * 32
     gx, gy, gz = (tuple(grid) + (1, 1))[:3]
+
+    # we call the msl kernel function and pass all the args (*packed)
+    # we specify the threadgroups layout. if (gx,gy,gz) is the number of
+    # threadgroups we want along each axis, then we need to provide
+    # the number of threads along each axis across all threadgroups 
+    # as an arg to msl kernel so the gpu creates the threadgroup layout we want
+    # we also specify how many threads in a threadgroup, 'threads' threads along 
+    # x in a threadgroup and 1 each on y and z
     kernel(*packed, threads=[gx * threads, gy, gz], group_size=[threads, 1, 1])
 
 

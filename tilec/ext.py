@@ -2,10 +2,10 @@ from . import language as tl
 from .jit import jit
 from .language import cdiv
 
-# one threadgroup on one GPU code sharing
+# one threadgroup on one GPU core sharing
 # that core's shared memory
 
-# largest tile size that can be help by a thread group
+# largest amount of data (input tiles + output tile) that can be held by a thread group
 # 128 threads x 32 registers each
 MAX_BLOCK = 4096
 
