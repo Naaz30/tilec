@@ -385,24 +385,17 @@ impl<'py> FrontEnd<'py> {
                           vec![("start", Attr::Int(start)), ("end", Attr::Int(end))]))
             }
             "load" => {
-                let (Some(Val::V(ptr)), Some(mask), Some(other)) = (arg(0, "pointer"), arg(1, "mask"), arg(2, "other")) else {
-                    return Err(self.error(node, "use tl.load(pointer, mask=..., other=...)"));
+                let Some(Val::V(ptr)) = arg(0, "pointer") else {
+                    return Err(self.error(node, "use tl.load(pointer)"));
                 };
+                if arg(1, "mask").is_some() || arg(2, "other").is_some() {
+                    return Err(self.error(node, "tl.load takes only a pointer for now (no mask or other)"));
+                }
                 let pty = self.func.ty(ptr).clone();
                 if !pty.ptr {
                     return Err(self.error(node, "tl.load needs a pointer"));
                 }
-                let Val::V(mask) = mask else { return Err(self.error(node, "mask must be a tensor")) };
-                let other = match other {
-                    Val::Int(i) => i as f64,
-                    Val::Float(f) => f,
-                    _ => return Err(self.error(node, "`other` must be a number")),
-                };
-                let m = self.broadcast_to(mask, &pty.shape, node)?;
-                let o = self.func.emit("constant", vec![], Some(Type::scalar(pty.elem)),
-                                       vec![("value", Attr::Float(other))]).unwrap();
-                let o = self.broadcast_to(o, &pty.shape, node)?;  
-                Ok(self.v("load", vec![ptr, m, o], Type { elem: pty.elem, ptr: false, shape: pty.shape }, vec![]))
+                Ok(self.v("load", vec![ptr], Type { elem: pty.elem, ptr: false, shape: pty.shape }, vec![]))
             }
             "store" => {
                 let (Some(Val::V(ptr)), Some(value)) = (arg(0, "pointer"), arg(1, "value")) else {

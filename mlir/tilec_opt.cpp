@@ -37,6 +37,8 @@ static llvm::DenseSet<Value> readOnlyBuffers(gpu::GPUFuncOp func) {
     for (Operation *user : arg.getUsers())
       if (auto st = dyn_cast<memref::StoreOp>(user))
         written |= st.getMemRef() == arg;
+      else if (isa<vector::StoreOp>(user))
+        written |= user->getOperand(1) == arg;
     if (!written)
       ro.insert(arg);
   }
@@ -229,6 +231,10 @@ struct Emitter {
     } else if (auto vl = dyn_cast<vector::LoadOp>(op)) {
       std::string space = cast<MemRefType>(vl.getBase().getType()).getMemorySpace() ? "threadgroup " : "device const ";
       define(vl.getResult(), "*(" + space + type(vl.getResult().getType()) + "*)(" + name(vl.getBase()) + " + " + name(vl.getIndices()[0]) + ")");
+    } else if (isa<vector::StoreOp>(op)) {
+      std::string space = cast<MemRefType>(op->getOperand(1).getType()).getMemorySpace() ? "threadgroup " : "device ";
+      line("*(" + space + type(op->getOperand(0).getType()) + "*)(" + operand(1) + " + " + operand(2) + ") = " +
+           operand(0) + ";");
     } else if (auto ex = dyn_cast<vector::ExtractOp>(op)) {
       std::string src = name(ex->getOperand(0));
       if (cast<VectorType>(ex->getOperand(0).getType()).getNumElements() == 1)

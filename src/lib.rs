@@ -1,4 +1,3 @@
-mod codegen;
 mod frontend;
 mod ir;
 mod mlir;
@@ -39,7 +38,7 @@ fn compile<'py>(fdef: Bound<'py, PyAny>, param_types: HashMap<String, String>,
             let (opt, msl) = mlir::lower(&tool, &mlir::generate(&fe.func, num_warps)?)?;
             Ok((format!("{ir}\n\n{opt}"), msl))
         }
-        _ => Ok((ir, codegen::generate(&fe.func, num_warps)?)),
+        _ => Err(CompileError::new_err(format!("only lowering via mlir supported now"))),
     }
 }
 

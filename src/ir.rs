@@ -16,13 +16,6 @@ impl Elem {
             Elem::F32 => "f32",
         }
     }
-    pub fn msl(self) -> &'static str {
-        match self {
-            Elem::I1 => "bool",
-            Elem::I32 => "int",
-            Elem::F32 => "float",
-        }
-    }
     pub fn is_int(self) -> bool {
         self == Elem::I32
     }

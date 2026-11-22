@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -55,9 +55,7 @@ struct Gen<'a> {
     mma_add: HashMap<usize, usize>,
     mma_out: HashMap<usize, usize>,
     dot_buf: HashMap<usize, String>,
-    versions: HashMap<usize, usize>,
-    version_loads: HashMap<usize, Vec<usize>>,
-    fast_loads: HashSet<usize>,
+    vec_src: HashMap<String, (String, usize)>,
 }
 
 impl<'a> Gen<'a> {
@@ -526,21 +524,8 @@ impl<'a> Gen<'a> {
         // record all accumulators
         self.find_accs();
 
-        // finds loops with bound checks that linearly increase so
-        // each check does not need to be performed
-        self.find_versions();
-
-        let mut j = 0;
-        while j < self.f.ops.len() {
-            if let Some(&e) = self.versions.get(&j) {
-                // write the loops that were identified by
-                // find versions
-                self.emit_versioned(j, e)?;
-                j = e + 1;
-                continue;
-            }
+        for j in 0..self.f.ops.len() {
             self.emit_op(j)?;
-            j += 1;
         }
 
         let cs: Vec<String> = self
@@ -805,69 +790,26 @@ impl<'a> Gen<'a> {
     }
 
     fn op_load(&mut self, op: &Op) -> PyResult<()> {
-        let (ptr, mask, other, r) = (
-            op.operands[0],
-            op.operands[1],
-            op.operands[2],
-            op.result.unwrap(),
-        );
+        let (ptr, r) = (op.operands[0], op.result.unwrap());
         let base = self.base[&ptr].clone();
         let e = mty(self.f.ty(r).elem);
         let shape = self.f.ty(r).shape.clone();
-
-        for o in [ptr, mask, other] {
-            if self.f.ty(o).shape != shape {
-                return Err(CompileError::new_err(
-                    "load operands must have the load's shape",
-                ));
-            }
-        }
 
         let w = match self.patch(&shape) {
             Some((_, _, [_, pc], _)) if pc == 2 || pc == 4 => pc,
             _ => 1,
         };
         let n = self.regs(r)?;
-        if w > 1 && self.fast_loads.contains(&r) {
-            if let Some(pa) = self.affine(ptr) {
+        if w > 1 {
+            if let Some(pa) = self.affine(ptr).filter(|pa| pa.coef[1].1 == Some(1)) {
                 let addrs = self.tile_addrs(&shape, &pa, w, n);
                 let vals = self.vector_loads(&base, e, w, &addrs);
                 self.names.insert(r, vals);
                 return Ok(());
             }
         }
-        let fast = if w > 1 && shape.len() == 2 {
-            self.whole_tile(ptr, mask, w)
-        } else {
-            None
-        };
-        let Some((cond, pa)) = fast else {
-            let slots = self.load_slots(&base, e, w, ptr, mask, other, n);
-            self.names.insert(r, slots);
-            return Ok(());
-        };
-
-        let addrs = self.tile_addrs(&shape, &pa, w, n);
-        let tys = vec![e; n].join(", ");
-        let res = self.fresh();
-        self.line(format!("{res}:{n} = scf.if {cond} -> ({tys}) {{"));
-        self.depth += 1;
-        self.cache.push(HashMap::new());
-        let vals = self.vector_loads(&base, e, w, &addrs);
-        self.line(format!("scf.yield {} : {tys}", vals.join(", ")));
-        self.cache.pop();
-        self.depth -= 1;
-        self.line("} else {".to_string());
-        self.depth += 1;
-        self.cache.push(HashMap::new());
-        let vals = self.load_slots(&base, e, w, ptr, mask, other, n);
-        self.line(format!("scf.yield {} : {tys}", vals.join(", ")));
-        self.cache.pop();
-        self.depth -= 1;
-        self.line("}".to_string());
-
-        self.names
-            .insert(r, (0..n).map(|k| format!("{res}#{k}")).collect());
+        let slots = self.load_slots(&base, e, w, ptr, n);
+        self.names.insert(r, slots);
         Ok(())
     }
 
@@ -889,7 +831,9 @@ impl<'a> Gen<'a> {
         for i in addrs {
             let x = self.op(format!("vector.load {base}[{i}] : memref<?x{e}>, {vty}"));
             for it in 0..w {
-                vals.push(self.op(format!("vector.extract {x}[{it}] : {e} from {vty}")));
+                let v = self.op(format!("vector.extract {x}[{it}] : {e} from {vty}"));
+                self.vec_src.insert(v.clone(), (x.clone(), it));
+                vals.push(v);
             }
         }
         vals
@@ -901,296 +845,44 @@ impl<'a> Gen<'a> {
         }
     }
 
-    // Runs before code generation and only looks at the tile IR, never at run-time values.
-    // For each innermost loop (loop_begin at op l, loop_end at op j), it keeps the
-    // 2-D loads whose pointer and mask change in a straight line with the loop
-    // variable (checked by lin). For those, one check of the first and last
-    // iteration is enough to prove every iteration is in bounds.
-    // If any load qualifies, it records:
-    //   versions[l] = j               this loop gets emitted twice by emit_versioned
-    //   version_loads[l] = [loads]    these loads become plain float4 loads in the clean version
-    fn find_versions(&mut self) {
-        let f = self.f;
-        let mut stack = Vec::new();
-        for (j, op) in f.ops.iter().enumerate() {
-            match op.opcode {
-                "loop_begin" => stack.push(j),
-                "loop_end" => {
-                    let Some(l) = stack.pop() else { continue };
-                    if f.ops[l + 1..j].iter().any(|o| o.opcode == "loop_begin") {
-                        continue;
-                    }
-                    let iv = f.ops[l].result.unwrap();
-                    let loads: Vec<usize> = (l + 1..j)
-                        .filter(|&k| {
-                            let o = &f.ops[k];
-                            o.opcode == "load"
-                                && f.ty(o.result.unwrap()).shape.len() == 2
-                                && self.lin(o.operands[0], iv, l, j).is_some()
-                                && self.lin(o.operands[1], iv, l, j).is_some()
-                        })
-                        .collect();
-                    if !loads.is_empty() {
-                        self.versions.insert(l, j);
-                        self.version_loads.insert(l, loads);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn lin(&self, v: usize, iv: usize, l: usize, e: usize) -> Option<u32> {
-        if v == iv {
-            return Some(1);
-        }
-        let Some(&d) = self.def.get(&v) else {
-            return Some(0);
-        };
-        if d <= l || d >= e {
-            return Some(0);
-        }
-        let op = &self.f.ops[d];
-        let deg = match op.opcode {
-            "constant" | "arange" => 0,
-            "broadcast" | "expand_dims" => self.lin(op.operands[0], iv, l, e)?,
-            "addptr" | "binary" | "compare" => {
-                let a = self.lin(op.operands[0], iv, l, e)?;
-                let b = self.lin(op.operands[1], iv, l, e)?;
-                let mul = op.opcode == "binary" && matches!(op.attr("kind"), Attr::Str("mul"));
-                if mul {
-                    a + b
-                } else {
-                    a.max(b)
-                }
-            }
-            _ => return None,
-        };
-        (deg <= 1).then_some(deg)
-    }
-
-    // emit a loop that find_versions picked as two versions:
-    // a check computed once before the loop, then
-    // scf.if clean { loop with plain float4 loads } else { the loop as before }
-    fn emit_versioned(&mut self, l: usize, e: usize) -> PyResult<()> {
-        // the loop_begin op, its loop variable (k), and the MLIR names of its start, end and step
-        let f = self.f;
-        let lop = &f.ops[l];
-        let iv = lop.result.unwrap();
-        let (lo, hi, st) = (
-            self.slot(lop.operands[0], 0),
-            self.slot(lop.operands[1], 0),
-            self.slot(lop.operands[2], 0),
-        );
-
-        // k of the first, second and last iteration, computed at run time
-        // first + last prove bounds, first + second prove alignment
-        // second falls back to first when the loop runs only once
-        // own cache scope: values built with a pretend k must not be reused inside the loops
-        self.cache.push(HashMap::new());
-        let n1 = self.op(format!("arith.addi {lo}, {st} : i32"));
-        let more = self.op(format!("arith.cmpi slt, {n1}, {hi} : i32"));
-        let second = self.op(format!("arith.select {more}, {n1}, {lo} : i32"));
-        let one = self.int(1);
-        let span = self.op(format!("arith.subi {hi}, {lo} : i32"));
-        let span = self.op(format!("arith.subi {span}, {one} : i32"));
-        let trips = self.op(format!("arith.divsi {span}, {st} : i32"));
-        let back = self.op(format!("arith.muli {trips}, {st} : i32"));
-        let last = self.op(format!("arith.addi {lo}, {back} : i32"));
-
-        // build the check: for each candidate load, run whole_tile with k set to the
-        // first, second and last iteration and AND the answers together
-        // a load joins `fast` only if all three checks could be built;
-        // `clean` is the AND over every load that joined
-        let mut clean: Option<String> = None;
-        let mut fast = HashSet::new();
-        for &k in &self.version_loads[&l].clone() {
-            let o = &f.ops[k];
-            let (ptr, mask, r) = (o.operands[0], o.operands[1], o.result.unwrap());
-            let shape = f.ty(r).shape.clone();
-            // float4 (or float2) width of this load; skip loads that can't vectorize
-            let w = match self.patch(&shape) {
-                Some((_, _, [_, pc], _)) if pc == 2 || pc == 4 => pc,
-                _ => continue,
-            };
-            let mut all: Option<String> = None;
-            for probe in [&lo, &second, &last] {
-                // pretend the loop variable is this iteration's k
-                self.names.insert(iv, vec![probe.clone()]);
-                let Some((c, _)) = self.whole_tile(ptr, mask, w) else {
-                    all = None;
-                    break;
-                };
-                all = Some(match all {
-                    Some(a) => self.op(format!("arith.andi {a}, {c} : i1")),
-                    None => c,
-                });
-            }
-            if let Some(a) = all {
-                fast.insert(r);
-                clean = Some(match clean {
-                    Some(c) => self.op(format!("arith.andi {c}, {a} : i1")),
-                    None => a,
-                });
-            }
-        }
-        // forget the pretend k and the values built with it
-        self.names.remove(&iv);
-        self.cache.pop();
-
-        // no load could be checked ahead: emit the loop once, unchanged
-        let Some(clean) = clean else {
-            for j in l..=e {
-                self.emit_op(j)?;
-            }
-            return Ok(());
-        };
-
-        // reserve a line for the scf.if header; its result types are only known
-        // after the loop is emitted, so it's filled in at the end
-        // save n_dot so both versions use the same shared-memory buffer names
-        let n_dot = self.n_dot;
-        let hdr = self.body.len();
-        self.line(String::new());
-        let pad = "  ".repeat(self.depth + 2);
-
-        // clean version: emit the loop with `fast` loads as plain float4 loads,
-        // then yield the loop's results out of the if
-        self.depth += 1;
-        self.cache.push(HashMap::new());
-        self.fast_loads = fast;
-        for j in l..=e {
-            self.emit_op(j)?;
-        }
-        self.fast_loads.clear();
-        let fa = self.done.pop().unwrap();
-        let types = fa.types.clone();
-        if !types.is_empty() {
-            let vals: Vec<String> = fa.results.concat();
-            self.line(format!(
-                "scf.yield {} : {}",
-                vals.join(", "),
-                types.join(", ")
-            ));
-        }
-        self.cache.pop();
-        self.depth -= 1;
-
-        // edge version: emit the same ops again, loads keep their per-iteration checks
-        self.line("} else {".to_string());
-        self.depth += 1;
-        self.cache.push(HashMap::new());
-        self.n_dot = n_dot;
-        for j in l..=e {
-            self.emit_op(j)?;
-        }
-        let sl = self.done.pop().unwrap();
-        if !types.is_empty() {
-            let vals: Vec<String> = sl.results.concat();
-            self.line(format!(
-                "scf.yield {} : {}",
-                vals.join(", "),
-                types.join(", ")
-            ));
-        }
-        self.cache.pop();
-        self.depth -= 1;
-        self.line("}".to_string());
-
-        // fill in the reserved header: %res:count = scf.if %clean -> (types) {
-        let res = self.fresh();
-        let count = types.len();
-        self.body[hdr] = if count == 0 {
-            format!("{pad}scf.if {clean} {{")
-        } else {
-            let lhs = if count == 1 {
-                res.clone()
-            } else {
-                format!("{res}:{count}")
-            };
-            format!("{pad}{lhs} = scf.if {clean} -> ({}) {{", types.join(", "))
-        };
-        // record the if's results (%res#0, %res#1, ...) as this loop's results,
-        // so loop_result after the loop reads them whichever version ran
-        let mut c = 0;
-        let results = sl
-            .results
-            .iter()
-            .map(|slot| {
-                slot.iter()
-                    .map(|_| {
-                        let name = if count == 1 {
-                            res.clone()
-                        } else {
-                            format!("{res}#{c}")
-                        };
-                        c += 1;
-                        name
-                    })
-                    .collect()
-            })
-            .collect();
-        self.done.push(Frame {
-            inits: sl.inits,
-            args: vec![],
-            results,
-            types,
-        });
-        Ok(())
-    }
-
-    fn load_slots(
-        &mut self,
-        base: &str,
-        e: &str,
-        w: usize,
-        ptr: usize,
-        mask: usize,
-        other: usize,
-        n: usize,
-    ) -> Vec<String> {
+    fn load_slots(&mut self, base: &str, e: &str, w: usize, ptr: usize, n: usize) -> Vec<String> {
         let vty = format!("vector<{w}x{e}>");
         let tys = vec![e; w].join(", ");
 
         let mut slots = Vec::new();
+        if w == 1 {
+            for k in 0..n {
+                let p = self.slot(ptr, k);
+                let i = self.to_index(&p);
+                slots.push(self.op(format!("memref.load {base}[{i}] : memref<?x{e}>")));
+            }
+            return slots;
+        }
         for j in 0..n / w {
-            let (mut safes, mut is, mut ms, mut os) =
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut ps, mut is) = (Vec::new(), Vec::new());
             for it in 0..w {
-                let k = w * j + it;
-                let (p, m, o) = (self.slot(ptr, k), self.slot(mask, k), self.slot(other, k));
-                let safe = self.op(format!("arith.select {m}, {p}, %zero : i32"));
-                let i = self.to_index(&safe);
-                safes.push(safe);
-                is.push(i);
-                ms.push(m);
-                os.push(o);
+                let p = self.slot(ptr, w * j + it);
+                is.push(self.to_index(&p));
+                ps.push(p);
             }
 
-            let mut ok = ms[0].clone();
+            let width = self.int(w as i64);
+            let rem = self.op(format!("arith.remui {}, {width} : i32", ps[0]));
+            let mut ok = self.op(format!("arith.cmpi eq, {rem}, %zero : i32"));
             for it in 1..w {
-                ok = self.op(format!("arith.andi {ok}, {} : i1", ms[it]));
                 let step = self.int(it as i64);
-                let want = self.op(format!("arith.addi {}, {step} : i32", safes[0]));
-                let same = self.op(format!("arith.cmpi eq, {}, {want} : i32", safes[it]));
+                let want = self.op(format!("arith.addi {}, {step} : i32", ps[0]));
+                let same = self.op(format!("arith.cmpi eq, {}, {want} : i32", ps[it]));
                 ok = self.op(format!("arith.andi {ok}, {same} : i1"));
             }
-            let width = self.int(w as i64);
-            let rem = self.op(format!("arith.remui {}, {width} : i32", safes[0]));
-            let aligned = self.op(format!("arith.cmpi eq, {rem}, %zero : i32"));
-            ok = self.op(format!("arith.andi {ok}, {aligned} : i1"));
 
             let res = self.fresh();
             self.line(format!("{res}:{w} = scf.if {ok} -> ({tys}) {{"));
             self.depth += 1;
-            let x = self.op(format!(
-                "vector.load {base}[{}] : memref<?x{e}>, {vty}",
-                is[0]
-            ));
+            let x = self.op(format!("vector.load {base}[{}] : memref<?x{e}>, {vty}", is[0]));
             let mut vals = Vec::new();
             for it in 0..w {
-                let xi = self.op(format!("vector.extract {x}[{it}] : {e} from {vty}"));
-                vals.push(self.op(format!("arith.select {}, {xi}, {} : {e}", ms[it], os[it])));
+                vals.push(self.op(format!("vector.extract {x}[{it}] : {e} from {vty}")));
             }
             self.line(format!("scf.yield {} : {tys}", vals.join(", ")));
             self.depth -= 1;
@@ -1198,8 +890,7 @@ impl<'a> Gen<'a> {
             self.depth += 1;
             let mut vals = Vec::new();
             for it in 0..w {
-                let x = self.op(format!("memref.load {base}[{}] : memref<?x{e}>", is[it]));
-                vals.push(self.op(format!("arith.select {}, {x}, {} : {e}", ms[it], os[it])));
+                vals.push(self.op(format!("memref.load {base}[{}] : memref<?x{e}>", is[it])));
             }
             self.line(format!("scf.yield {} : {tys}", vals.join(", ")));
             self.depth -= 1;
@@ -1210,27 +901,6 @@ impl<'a> Gen<'a> {
             }
         }
         slots
-    }
-
-    fn whole_tile(&mut self, ptr: usize, mask: usize, w: usize) -> Option<(String, Aff)> {
-        let pa = self.affine(ptr)?;
-        if pa.coef[1].1 != Some(1) {
-            return None;
-        }
-        let mut cond = self.all_true(mask)?;
-        let wc = self.sc_int(w as i64);
-        for s in [pa.base.clone(), pa.coef[0].clone()] {
-            match s.1 {
-                Some(c) if c % w as i64 != 0 => return None,
-                Some(_) => {}
-                None => {
-                    let rem = self.op(format!("arith.remui {}, {} : i32", s.0, wc.0));
-                    let ok = self.op(format!("arith.cmpi eq, {rem}, %zero : i32"));
-                    cond = self.op(format!("arith.andi {cond}, {ok} : i1"));
-                }
-            }
-        }
-        Some((cond, pa))
     }
 
     fn sc_int(&mut self, v: i64) -> Sc {
@@ -1372,48 +1042,6 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn all_true(&mut self, m: usize) -> Option<String> {
-        let f = self.f;
-        let t = f.ty(m);
-        if t.elem != Elem::I1 {
-            return None;
-        }
-        if t.is_scalar() {
-            return self.names.get(&m).map(|n| n[0].clone());
-        }
-        let shape = &t.shape;
-        let op = &f.ops[*self.def.get(&m)?];
-        match op.opcode {
-            "broadcast" | "expand_dims" => self.all_true(op.operands[0]),
-            "binary" if matches!(op.attr("kind"), Attr::Str("and")) => {
-                let a = self.all_true(op.operands[0])?;
-                let b = self.all_true(op.operands[1])?;
-                Some(self.op(format!("arith.andi {a}, {b} : i1")))
-            }
-            "compare" if matches!(op.attr("kind"), Attr::Str("lt")) => {
-                let (x, y) = (op.operands[0], op.operands[1]);
-                if f.ty(x).elem != Elem::I32 {
-                    return None;
-                }
-                let a = self.affine(x)?;
-                let a = Self::widen(a, &f.ty(x).shape, shape)?;
-                let b = self.affine(y)?;
-                let b = Self::widen(b, &f.ty(y).shape, shape)?;
-                let mut off = 0i64;
-                for d in 0..shape.len() {
-                    let c = a.coef[d].1? - b.coef[d].1?;
-                    if c > 0 {
-                        off += c * (shape[d] as i64 - 1);
-                    }
-                }
-                let o = self.sc_int(off);
-                let top = self.sc_add(&a.base, &o);
-                Some(self.op(format!("arith.cmpi slt, {}, {} : i32", top.0, b.base.0)))
-            }
-            _ => None,
-        }
-    }
-
     fn op_store(&mut self, op: &Op) -> PyResult<()> {
         let (ptr, val) = (op.operands[0], op.operands[1]);
         let mask = op.operands.get(2).copied();
@@ -1472,6 +1100,58 @@ impl<'a> Gen<'a> {
             None => None,
         };
         let shape = self.f.ty(v).shape.clone();
+        let w = if transpose || owner.is_some() {
+            1
+        } else {
+            match self.patch(&shape) {
+                Some((_, _, [_, pc], _)) if (pc == 2 || pc == 4) && shape[1] % pc == 0 && off % pc == 0 => pc,
+                _ => 1,
+            }
+        };
+        if w > 1 {
+            let vty = format!("vector<{w}xf32>");
+            let cols = self.int(shape[1] as i64);
+            let mut scalar = Vec::new();
+            for k0 in (0..self.regs(v)?).step_by(w) {
+                let src: Vec<Option<(String, usize)>> =
+                    (0..w).map(|t| self.vec_src.get(&self.slot(v, k0 + t)).cloned()).collect();
+                let whole = match &src[0] {
+                    Some((x, 0)) => src.iter().enumerate().all(|(t, s)| s.as_ref() == Some(&(x.clone(), t))),
+                    _ => false,
+                };
+                if !whole {
+                    scalar.extend(k0..k0 + w);
+                    continue;
+                }
+                let x = src[0].as_ref().unwrap().0.clone();
+                let cs = self.coords(&shape, k0);
+                let r = self.op(format!("arith.muli {}, {cols} : i32", cs[0]));
+                let e = self.op(format!("arith.addi {r}, {} : i32", cs[1]));
+                let e = if off > 0 {
+                    let o = self.int(off as i64);
+                    self.op(format!("arith.addi {e}, {o} : i32"))
+                } else {
+                    e
+                };
+                let i = self.to_index(&e);
+                self.line(format!("vector.store {x}, {buf}[{i}] : {wty}, {vty}"));
+            }
+            for k in scalar {
+                let cs = self.coords(&shape, k);
+                let r = self.op(format!("arith.muli {}, {cols} : i32", cs[0]));
+                let e = self.op(format!("arith.addi {r}, {} : i32", cs[1]));
+                let e = if off > 0 {
+                    let o = self.int(off as i64);
+                    self.op(format!("arith.addi {e}, {o} : i32"))
+                } else {
+                    e
+                };
+                let i = self.to_index(&e);
+                let x = self.slot(v, k);
+                self.line(format!("memref.store {x}, {buf}[{i}] : {wty}"));
+            }
+            return Ok(());
+        }
         for k in 0..self.regs(v)? {
             let e = if transpose {
                 let cs = self.coords(&shape, k);
@@ -1822,6 +1502,7 @@ impl<'a> Gen<'a> {
             bcols.push(self.op(format!("arith.addi {col0}, {off} : i32")));
         }
 
+        // initialize all the n accumulators needed for the simd
         let start: Vec<String> = match &acc {
             Some(v) => v.clone(),
             None => {
@@ -1830,6 +1511,7 @@ impl<'a> Gen<'a> {
                 vec![z; n]
             }
         };
+
         let (lo, hi, step) = (self.idx(0), self.idx(bk as i64), self.idx(8));
         let res = self.fresh();
         let kk = self.fresh();
@@ -1851,12 +1533,8 @@ impl<'a> Gen<'a> {
         ));
         self.depth += 1;
         let kki = self.op(format!("arith.index_cast {kk} : index to i32"));
-        let mut av = Vec::new();
-        for i in 0..mi {
-            let ai = self.op(format!("arith.addi {}, {kki} : i32", arows[i]));
-            let ai = self.to_index(&ai);
-            av.push(self.op(format!("gpu.subgroup_mma_load_matrix {buf}[{ai}] {{leadDimension = {bk} : index}} : {ty} -> {AMAT}")));
-        }
+        
+        
         let krow = self.op(format!("arith.muli {kki}, {bnc} : i32"));
         let mut bv = Vec::new();
         for j in 0..mj {
@@ -1866,10 +1544,13 @@ impl<'a> Gen<'a> {
         }
         let mut next = Vec::new();
         for i in 0..mi {
+            let ai = self.op(format!("arith.addi {}, {kki} : i32", arows[i]));
+            let ai = self.to_index(&ai);
+            let av = self.op(format!("gpu.subgroup_mma_load_matrix {buf}[{ai}] {{leadDimension = {bk} : index}} : {ty} -> {AMAT}"));
             for j in 0..mj {
                 next.push(self.op(format!(
                     "gpu.subgroup_mma_compute {}, {}, {} : {AMAT}, {BMAT} -> {CMAT}",
-                    av[i],
+                    av,
                     bv[j],
                     accs[i * mj + j]
                 )));
@@ -1922,7 +1603,6 @@ impl<'a> Gen<'a> {
     // 1. One shared buffer %dot{d}s of max(bm·bk + bk·bn, bm/2·bn) floats (8 KB here):
     //        [ A row-major bm×bk | B row-major bk×bn ]   offsets 0 and boff = bm·bk
     //    later reused by mma_to_patch to hold half of C (bm/2 × bn).
-    //    When emit_versioned emits the loop twice, both versions share this buffer.
     // 2. barrier → stage A, stage B → barrier
     //    the first barrier: nobody may still be reading the old contents (write after read)
     //    the second: every value is written before anyone reads it (read after write)
@@ -1985,9 +1665,7 @@ pub fn generate(f: &Function, num_warps: usize) -> PyResult<String> {
         mma_add: HashMap::new(),
         mma_out: HashMap::new(),
         dot_buf: HashMap::new(),
-        versions: HashMap::new(),
-        version_loads: HashMap::new(),
-        fast_loads: HashSet::new(),
+        vec_src: HashMap::new(),
     }
     .generate()
 }
